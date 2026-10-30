@@ -1,0 +1,6 @@
+models/
+*.o
+/build/
+/dsm
+/tests/bin/
+*.metallib
