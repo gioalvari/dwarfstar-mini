@@ -60,6 +60,9 @@ static int generate(server *s, int fd, const dsm_json *root) {
     if (max_tokens < 0 || !make_prompt(root, &prompt) || !dsm_tokenize(s->tokenizer, prompt.data, 0, &tokens) || tokens.len + (size_t)max_tokens > s->context) { error_response(fd, 400, "invalid messages or context length"); goto done; }
     if (stop_v) { if (stop_v->type == DSM_JSON_STRING) stop_count = 1; else if (stop_v->type == DSM_JSON_ARRAY) stop_count = stop_v->count; else { error_response(fd, 400, "stop must be a string or array"); goto done; } stops = calloc(stop_count, sizeof(*stops)); if (!stops) goto done; for (size_t i = 0; i < stop_count; ++i) { stops[i] = dsm_json_string_dup(stop_v->type == DSM_JSON_STRING ? stop_v : stop_v->items[i]); if (!stops[i]) { error_response(fd, 400, "stop must contain strings"); goto done; } } }
     reused = common_prefix(s->cached, s->cached_len, tokens.ids, tokens.len);
+    /* The cached logits follow the last generated token, not the last prompt
+       token. Re-evaluate that prompt token when the entire prompt is reused. */
+    if (reused == tokens.len && reused) --reused;
     if (s->use_metal && !dsm_metal_truncate(s->metal, (uint32_t)reused)) { error_response(fd, 500, "cache state error"); goto done; }
     if (!s->use_metal && !dsm_forward_truncate(s->forward, (uint32_t)reused)) { error_response(fd, 500, "cache state error"); goto done; }
     double prefill_started = now(); for (size_t i = reused; i < tokens.len; ++i) if (!(s->use_metal ? dsm_metal_token(s->metal, tokens.ids[i], s->logits) : dsm_forward_token(s->forward, tokens.ids[i], s->logits))) { error_response(fd, 500, "prompt inference failed"); goto done; } double prefill_elapsed = now() - prefill_started;
