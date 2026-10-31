@@ -9,11 +9,12 @@
 #include <string.h>
 #include <time.h>
 
-static void usage(const char *argv0) { fprintf(stderr,"usage: %s -m MODEL -p PROMPT [-n N] [--backend metal|cpu] [--temp T] [--chat] [--dump-logits FILE] [--tokens-only]\n",argv0); }
+static void usage(const char *argv0) { fprintf(stderr,"usage: %s -m MODEL -p PROMPT [-n N] [--backend metal|cpu] [--threads N] [--temp T] [--chat] [--dump-logits FILE] [--tokens-only]\n",argv0); }
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}
 int main(int argc, char **argv) {
     const char *path = NULL, *prompt = NULL, *dump = NULL, *backend = NULL;
     int n = 16, chat = 0, tokens_only = 0;
+    uint32_t threads = 8;
     float temp = 0;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) path = argv[++i];
@@ -21,12 +22,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--backend") && i + 1 < argc) backend = argv[++i];
+        else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--chat")) chat = 1;
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) dump = argv[++i];
         else if (!strcmp(argv[i], "--tokens-only")) tokens_only = 1;
         else { usage(argv[0]); return 2; }
     }
-    if (!path || !prompt || n < 0) { usage(argv[0]); return 2; }
+    if (!path || !prompt || n < 0 || !threads) { usage(argv[0]); return 2; }
     char *rendered = NULL;
     if (chat) { size_t len = strlen(prompt) + 64; rendered = malloc(len); if (!rendered) return 1; snprintf(rendered, len, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", prompt); prompt = rendered; }
     dsm_model model;
@@ -45,7 +47,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "dsm: Metal unavailable (%s); falling back to CPU\n", metal_error); use_metal = 0;
         }
     }
-    if (!use_metal && !dsm_forward_init(&f, &model, context)) { fprintf(stderr, "dsm: cannot allocate CPU forward state\n"); return 1; }
+    if (!use_metal && !dsm_forward_init(&f, &model, context, threads)) { fprintf(stderr, "dsm: cannot allocate CPU forward state\n"); return 1; }
     float *logits = malloc((size_t)model.vocab * sizeof(*logits)); if (!logits) return 1;
     double prefill_started = now();
     for (size_t i = 0; i < ids.len; ++i) if (!(use_metal ? dsm_metal_token(metal, ids.ids[i], logits) : dsm_forward_token(f, ids.ids[i], logits))) { fprintf(stderr, "dsm: prompt inference failed\n"); return 1; }
