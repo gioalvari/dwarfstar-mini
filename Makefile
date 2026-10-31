@@ -1,7 +1,7 @@
 CC := clang
 CFLAGS := -O3 -mcpu=native -std=c11 -Wall -Wextra -Wpedantic -Isrc
 LDFLAGS := -lm -lpthread -framework Metal -framework Foundation
-SRC := src/gguf.c src/quants.c src/model.c src/tokenizer.c src/forward.c src/sampler.c src/metal.m
+SRC := src/gguf.c src/quants.c src/model.c src/tokenizer.c src/forward.c src/sampler.c src/json.c src/server.c src/metal.m
 
 .PHONY: all clean test check-quants check-metal-gemv
 all: dsm

@@ -71,6 +71,7 @@ static void rope(float *x,uint32_t heads,uint32_t dim,uint32_t pos,float base) {
 int dsm_forward_init(dsm_forward **out,const dsm_model *m,uint32_t context,uint32_t threads) { *out=NULL; if(!context||context>m->context||!threads)return 0; dsm_forward *s=calloc(1,sizeof(*s)); if(!s)return 0;s->m=m;s->context=context;s->threads=threads;uint64_t kv=(uint64_t)m->layers*context*m->kv_heads*m->key_dim;uint32_t ffn=m->is_moe?m->expert_hidden:m->hidden;s->k_cache=malloc(kv*4);s->v_cache=malloc(kv*4);s->x=malloc(m->dim*4);s->norm=malloc(m->dim*4);s->q=malloc(m->dim*4);s->k=malloc(m->kv_heads*m->key_dim*4);s->v=malloc(m->kv_heads*m->value_dim*4);s->att=malloc(m->dim*4);s->tmp=malloc(m->dim*4);s->gate=malloc(ffn*4);s->up=malloc(ffn*4);s->route=m->is_moe?malloc(m->experts*4):NULL;s->scores=malloc(context*4);if(!s->k_cache||!s->v_cache||!s->x||!s->norm||!s->q||!s->k||!s->v||!s->att||!s->tmp||!s->gate||!s->up||(m->is_moe&&!s->route)||!s->scores){dsm_forward_free(s);return 0;}*out=s;return 1; }
 void dsm_forward_free(dsm_forward *s){if(!s)return;free(s->k_cache);free(s->v_cache);free(s->x);free(s->norm);free(s->q);free(s->k);free(s->v);free(s->att);free(s->tmp);free(s->gate);free(s->up);free(s->route);free(s->scores);free(s);}
 uint32_t dsm_forward_pos(const dsm_forward *s){return s->pos;}
+int dsm_forward_truncate(dsm_forward *s,uint32_t pos){if(!s||pos>s->pos)return 0;s->pos=pos;return 1;}
 static void moe_ffn(dsm_forward *s, const dsm_layer *w) {
     const dsm_model *m = s->m;
     uint32_t selected[m->experts_used];

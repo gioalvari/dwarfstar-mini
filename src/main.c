@@ -2,6 +2,7 @@
 #include "metal.h"
 #include "model.h"
 #include "sampler.h"
+#include "server.h"
 #include "tokenizer.h"
 
 #include <stdio.h>
@@ -9,9 +10,27 @@
 #include <string.h>
 #include <time.h>
 
-static void usage(const char *argv0) { fprintf(stderr,"usage: %s -m MODEL -p PROMPT [-n N] [--backend metal|cpu] [--threads N] [--temp T] [--chat] [--dump-logits FILE] [--tokens-only]\n",argv0); }
+static void usage(const char *argv0) { fprintf(stderr,"usage: %s -m MODEL -p PROMPT [-n N] [--backend metal|cpu] [--threads N] [--temp T] [--chat] [--dump-logits FILE] [--tokens-only]\n       %s serve -m MODEL [--backend metal|cpu] [--host 127.0.0.1] [--port 8080] [--ctx N] [--threads N] [--alias NAME]\n",argv0,argv0); }
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}
 int main(int argc, char **argv) {
+    if (argc > 1 && (!strcmp(argv[1], "serve") || !strcmp(argv[1], "--serve"))) {
+        dsm_server_config config = {
+            .host = "127.0.0.1", .port = 8080, .threads = 8,
+        };
+        const char *path = NULL;
+        for (int i = 2; i < argc; ++i) {
+            if (!strcmp(argv[i], "-m") && i + 1 < argc) path = argv[++i];
+            else if (!strcmp(argv[i], "--backend") && i + 1 < argc) config.backend = argv[++i];
+            else if (!strcmp(argv[i], "--host") && i + 1 < argc) config.host = argv[++i];
+            else if (!strcmp(argv[i], "--port") && i + 1 < argc) config.port = (uint16_t)strtoul(argv[++i], NULL, 10);
+            else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) config.context = (uint32_t)strtoul(argv[++i], NULL, 10);
+            else if (!strcmp(argv[i], "--threads") && i + 1 < argc) config.threads = (uint32_t)strtoul(argv[++i], NULL, 10);
+            else if (!strcmp(argv[i], "--alias") && i + 1 < argc) config.alias = argv[++i];
+            else { usage(argv[0]); return 2; }
+        }
+        if (!path || !config.port || !config.threads) { usage(argv[0]); return 2; }
+        return dsm_server_run(path, &config);
+    }
     const char *path = NULL, *prompt = NULL, *dump = NULL, *backend = NULL;
     int n = 16, chat = 0, tokens_only = 0;
     uint32_t threads = 8;
