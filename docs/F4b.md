@@ -97,6 +97,57 @@ this M4 Pro has 48 GB unified memory, but the model is larger than the device's
 recommended working set after runtime/KV allocations. It is intentionally
 skipped rather than relying on memory pressure.
 
+## Qwen3-Coder-30B-A3B-Instruct
+
+`models/Qwen3-Coder-30B-A3B-asym.gguf` is produced read-only from
+`Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf` with the same per-tensor scheme:
+
+```sh
+../llama.cpp/build/bin/llama-quantize --allow-requantize \
+  --tensor-type-file /tmp/qwen3-coder-asym-types.txt \
+  models/Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf \
+  models/Qwen3-Coder-30B-A3B-asym.gguf Q8_0
+```
+
+The tensor-type file assigns each routed `ffn_gate_exps.weight` and
+`ffn_up_exps.weight` to Q3_K and each `ffn_down_exps.weight` to Q4_K. The
+result is 15,421,505,504 bytes (14.36 GiB): 96 Q3_K tensors (8,304,721,920
+bytes), 48 Q4_K tensors (5,435,817,984 bytes), 194 Q8_0 tensors
+(1,623,818,240 bytes), and 241 F32 tensors (51,175,424 bytes).
+
+The model declares `qwen3moe`, 48 layers, 128 experts with top-8 routing,
+and a 262,144-token training context. The server caps an unspecified context
+to 8,192 tokens so the default KV cache is 1,536 MiB
+(`48 * 8192 * 4 * 128 * 2 * sizeof(float)`); `--ctx` can request a smaller or
+larger value up to the model limit.
+
+The GGUF `tokenizer.chat_template` renders ordinary
+`<|im_start|>role\n...<|im_end|>` turns and an
+`<|im_start|>assistant\n` generation prompt; it contains no `<think>`
+prefix. DSM uses that same simple user-turn form for `--chat` and stops when
+the `<|im_end|>` token is sampled. A 900-token palindrome request stopped at
+723 generated tokens, before its limit, after producing a complete response.
+
+| Gate on M4 Pro | Result |
+| --- | --- |
+| Metal greedy, Fibonacci `-n 48` | exact continuation vs `llama-simple` Metal |
+| Metal greedy, France `-n 24` | exact continuation vs `llama-simple` Metal |
+| CPU vs Metal first-step logits | max abs `3.8146973e-05`; argmax `198` on both |
+| `make test` | passed |
+
+| Model / backend | Decode tok/s |
+| --- | ---: |
+| Coder asymmetric, DSM Metal, Fibonacci `-n 48` | 47.35 |
+| Coder asymmetric, DSM Metal, France `-n 24` | 47.87 |
+| Coder asymmetric, llama.cpp Metal, Fibonacci | 57.81 |
+| Coder asymmetric, llama.cpp Metal, France | 57.38 |
+
+Example chat output for `Write a Python function that checks if a string is a
+palindrome.` begins with a documented `is_palindrome` implementation that
+normalizes alphanumeric characters before comparing `cleaned` with
+`cleaned[::-1]`. It also provides a two-pointer variant, test cases, and ends
+with the recommendation to use the main function for typical inputs.
+
 ```sh
 ./dsm --backend metal -m models/Qwen3-30B-A3B-asym.gguf \
   -p 'The capital of France is' -n 8

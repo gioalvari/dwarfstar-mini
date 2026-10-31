@@ -73,7 +73,7 @@ int main(int argc, char **argv) {
     double prefill_elapsed = now() - prefill_started;
     if (dump) { FILE *fp = fopen(dump, "wb"); if (!fp || fwrite(logits, sizeof(*logits), model.vocab, fp) != model.vocab) { fprintf(stderr, "dsm: failed to write logits\n"); return 1; } fclose(fp); }
     dsm_sampler sampler; dsm_sampler_init(&sampler, temp, 0.95f, 1); double decode_started = now(); int generated = 0;
-    for (int i = 0; i < n; ++i) { int32_t id = dsm_sample(&sampler, logits, model.vocab); if (!dsm_token_decode(tok, id, stdout) || !(use_metal ? dsm_metal_token(metal, id, logits) : dsm_forward_token(f, id, logits))) break; ++generated; }
+    for (int i = 0; i < n; ++i) { int32_t id = dsm_sample(&sampler, logits, model.vocab); if ((chat && dsm_token_is_im_end(tok, id)) || !dsm_token_decode(tok, id, stdout) || !(use_metal ? dsm_metal_token(metal, id, logits) : dsm_forward_token(f, id, logits))) break; ++generated; }
     double decode_elapsed = now() - decode_started;
     fprintf(stderr, "\ndsm: %s prefill %.2f tokens/s (%zu tokens, %.3f s); decode %.2f tokens/s (%d tokens, %.3f s)\n", use_metal ? "metal" : "cpu", ids.len / prefill_elapsed, ids.len, prefill_elapsed, generated / decode_elapsed, generated, decode_elapsed);
     free(logits); dsm_forward_free(f); dsm_metal_free(metal); dsm_tokens_free(&ids); dsm_tokenizer_free(tok); dsm_model_close(&model); free(rendered); return 0;

@@ -5,7 +5,15 @@
 
 int main(int argc, char **argv) {
     gguf_file file;
-    if (argc != 2 || !gguf_open(&file, argv[1])) return 1;
+    if ((argc != 2 && argc != 3) || !gguf_open(&file, argv[1])) return 1;
+    if (argc == 3) {
+        gguf_str value;
+        int ok = !strcmp(argv[2], "--chat-template") &&
+                 gguf_get_string(&file, "tokenizer.chat_template", &value);
+        if (ok) printf("%.*s\n", (int)value.len, value.ptr);
+        gguf_close(&file);
+        return ok ? 0 : 1;
+    }
     uint64_t count[64] = {0}, bytes[64] = {0};
     for (uint64_t i = 0; i < file.n_kv; ++i) {
         gguf_kv *kv = &file.kv[i];

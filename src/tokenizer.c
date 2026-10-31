@@ -136,3 +136,4 @@ int dsm_token_decode(const dsm_tokenizer *t, int32_t id, FILE *out) {
     if(kind == 3) return fwrite(s.ptr,1,(size_t)s.len,out)==s.len;
     for(size_t p=0;p<s.len;) { unsigned char c=(unsigned char)s.ptr[p++]; unsigned cp=c; if(c>=0xc0 && p<s.len) { unsigned char c2=(unsigned char)s.ptr[p++]; cp=((unsigned)(c&31)<<6)|(c2&63); } unsigned byte=cp; if(cp>=256&&cp<256+68) { unsigned rank=cp-256, seen=0; for(unsigned j=0;j<256;++j) if(!((j>=33&&j<=126)||(j>=161&&j<=172)||(j>=174&&j<=255)) && seen++==rank) { byte=j; break; } } if(fputc((int)byte,out)==EOF) return 0; } return 1;
 }
+int dsm_token_is_im_end(const dsm_tokenizer *t, int32_t id) { return id == t->im_end; }

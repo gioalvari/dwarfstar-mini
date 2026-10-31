@@ -13,6 +13,7 @@ void dsm_tokenizer_free(dsm_tokenizer *tokenizer);
 int dsm_tokenize(const dsm_tokenizer *tokenizer, const char *text, int add_bos,
                  dsm_tokens *tokens);
 int dsm_token_decode(const dsm_tokenizer *tokenizer, int32_t id, FILE *out);
+int dsm_token_is_im_end(const dsm_tokenizer *tokenizer, int32_t id);
 void dsm_tokens_free(dsm_tokens *tokens);
 
 #endif
