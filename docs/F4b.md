@@ -23,8 +23,8 @@ owns complete rows, results are invariant to the thread count.
 with `llama-quantize --allow-requantize`: routed `ffn_gate_exps` and
 `ffn_up_exps` are Q3_K; routed `ffn_down_exps` is Q4_K; all other tensors
 retain their Q8_0 or F32 source types. It is 15,421,502,976 bytes (14.36 GiB,
-4.04 bpw). The tensor histogram is 288 Q3_K expert tensors, 48 Q4_K expert
-tensors, 147 Q8_0 tensors, and 96 F32 tensors. `llama-simple` Metal produced
+4.04 bpw). `tools/gguf_inspect` reports 96 Q3_K expert tensors, 48 Q4_K
+expert tensors, 194 Q8_0 tensors, and 241 F32 tensors. `llama-simple` Metal produced
 the coherent France continuation `Paris. The capital of the United Kingdom is
 London...` and measured 64.76 decode tok/s (15 generated-token evaluations).
 
@@ -35,6 +35,29 @@ three expert tensors remain `newBufferWithBytesNoCopy` views of the GGUF mmap;
 large tensors are addressed through contiguous max-buffer-length views. Q and
 attention buffers use their derived widths (`heads * key_length` and
 `heads * value_length`) rather than assuming either equals embedding width.
+
+## Gates on M4 Pro (48 GB)
+
+| Gate | Result |
+| --- | --- |
+| Asymmetric CPU vs Metal first prompt logits | max abs `4.20e-05`; argmax `12095` on both |
+| Asymmetric greedy, France `-n 16` | DSM Metal exactly matches `llama-simple` continuation |
+| Asymmetric greedy, Fibonacci `-n 32` | DSM Metal exactly matches `llama-simple` continuation |
+| 1.7B Q4_K_M long prompt, `-n 128` | CPU and Metal output exactly matches |
+| `make test` | passed |
+| `dsm serve` + one Metal curl | passed; chat completion returned |
+
+| Model / backend | Decode tok/s |
+| --- | ---: |
+| 30B asymmetric, DSM Metal, France `-n 16` | 15.58 |
+| 30B asymmetric, DSM Metal, Fibonacci `-n 32` | 16.68 |
+| 30B asymmetric, llama.cpp Metal, France | 64.41 |
+| 30B asymmetric, llama.cpp Metal, Fibonacci | 60.07 |
+
+The 32.48 GB Q8_0 model was not run through the final full-GPU comparison:
+this M4 Pro has 48 GB unified memory, but the model is larger than the device's
+recommended working set after runtime/KV allocations. It is intentionally
+skipped rather than relying on memory pressure.
 
 ```sh
 ./dsm --backend metal -m models/Qwen3-30B-A3B-asym.gguf \
