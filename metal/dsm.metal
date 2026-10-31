@@ -351,8 +351,105 @@ inline float k_weight(device const uchar *b, uint type, uint i) {
 #define K_GEMV(NAME, TYPE, BYTES) \
 kernel void NAME(device const uchar *w [[buffer(0)]], device const float *x [[buffer(1)]], device float *y [[buffer(2)]], constant Gemv &p [[buffer(3)]], ushort tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]], threadgroup float *sum [[threadgroup(0)]]) { \
     float v=0; if(row<p.out) { device const uchar *r=w+row*(p.in/256)*BYTES; for(uint j=tid;j<p.in;j+=256) v+=k_weight(r+(j/256)*BYTES,TYPE,j%256)*x[j]; } sum[tid]=v; threadgroup_barrier(mem_flags::mem_threadgroup); for(uint step=128;step;step>>=1){if(tid<step)sum[tid]+=sum[tid+step];threadgroup_barrier(mem_flags::mem_threadgroup);} if(!tid&&row<p.out)y[row]=sum[0]; }
-K_GEMV(q3k_gemv, 1, 110)
 K_GEMV(q5k_gemv, 3, 176)
+
+struct block_q3_K { uchar hmask[32]; uchar qs[64]; uchar scales[12]; half d; };
+
+template<short nr0>
+static inline void q3k_gemv_impl(device const block_q3_K *x, device const float *yy,
+                                  device float *dst, uint in, uint out,
+                                  uint64_t row_bytes, int first_row,
+                                  ushort tiisg) {
+    const int nb = in / 256;
+    float yl[32];
+    const short tid = tiisg / 4;
+    const short ix = tiisg % 4;
+    const short ip = tid / 4;
+    const short il = 2 * ((tid % 4) / 2);
+    const short ir = tid % 2;
+    const short l0 = 8 * ir;
+    const ushort4 mm[4] = {{0x0001, 0x0100, 0x0002, 0x0200},
+                           {0x0004, 0x0400, 0x0008, 0x0800},
+                           {0x0010, 0x1000, 0x0020, 0x2000},
+                           {0x0040, 0x4000, 0x0080, 0x8000}};
+    const int4 qm[2] = {{0x0003, 0x0300, 0x000c, 0x0c00},
+                        {0x0030, 0x3000, 0x00c0, 0xc000}};
+    const ushort4 hm = mm[2 * ip + il / 2];
+    const short shift = 2 * il;
+    const float v1 = il == 0 ? 4.f : 64.f;
+    const float v2 = 4.f * v1;
+    const uint16_t s_shift1 = 4 * ip;
+    const uint16_t s_shift2 = s_shift1 + il;
+    const short q_offset = 32 * ip + l0;
+    const short y_offset = 128 * ip + 32 * il + l0;
+    device const float *y1 = yy + ix * 256 + y_offset;
+    uint32_t scales32, aux32;
+    thread uint16_t *scales16 = (thread uint16_t *)&scales32;
+    thread const int8_t *scales = (thread const int8_t *)&scales32;
+    float sumf1[nr0] = {0.f};
+    float sumf2[nr0] = {0.f};
+    for (int i = ix; i < nb; i += 4) {
+        for (short l = 0; l < 8; ++l) {
+            yl[l + 0] = y1[l + 0];
+            yl[l + 8] = y1[l + 16];
+            yl[l + 16] = y1[l + 32];
+            yl[l + 24] = y1[l + 48];
+        }
+        device const uint16_t *q = (device const uint16_t *)(x[i].qs + q_offset);
+        device const uint16_t *h = (device const uint16_t *)(x[i].hmask + l0);
+        device const uint16_t *a = (device const uint16_t *)(x[i].scales);
+        device const half *dh = &x[i].d;
+        for (short row = 0; row < nr0; ++row) {
+            const float d_all = (float)dh[0];
+            scales16[0] = a[4]; scales16[1] = a[5];
+            aux32 = ((scales32 >> s_shift2) << 4) & 0x30303030;
+            scales16[0] = a[il + 0]; scales16[1] = a[il + 1];
+            scales32 = ((scales32 >> s_shift1) & 0x0f0f0f0f) | aux32;
+            float s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0;
+            for (short l = 0; l < 8; l += 2) {
+                const int32_t qs = q[l / 2];
+                s1 += yl[l + 0] * (qs & qm[il / 2][0]);
+                s2 += yl[l + 1] * (qs & qm[il / 2][1]);
+                s3 += ((h[l / 2] & hm[0]) ? 0.f : yl[l + 0]) + ((h[l / 2] & hm[1]) ? 0.f : yl[l + 1]);
+                s4 += yl[l + 16] * (qs & qm[il / 2][2]);
+                s5 += yl[l + 17] * (qs & qm[il / 2][3]);
+                s6 += ((h[l / 2] & hm[2]) ? 0.f : yl[l + 16]) + ((h[l / 2] & hm[3]) ? 0.f : yl[l + 17]);
+            }
+            float d1 = d_all * (s1 + 1.f / 256.f * s2 - s3 * v1);
+            float d2 = d_all * (s4 + 1.f / 256.f * s5 - s6 * v2);
+            sumf1[row] += d1 * (scales[0] - 32); sumf2[row] += d2 * (scales[2] - 32);
+            s1 = s2 = s3 = s4 = s5 = s6 = 0;
+            for (short l = 0; l < 8; l += 2) {
+                const int32_t qs = q[l / 2 + 8];
+                s1 += yl[l + 8] * (qs & qm[il / 2][0]);
+                s2 += yl[l + 9] * (qs & qm[il / 2][1]);
+                s3 += ((h[l / 2 + 8] & hm[0]) ? 0.f : yl[l + 8]) + ((h[l / 2 + 8] & hm[1]) ? 0.f : yl[l + 9]);
+                s4 += yl[l + 24] * (qs & qm[il / 2][2]);
+                s5 += yl[l + 25] * (qs & qm[il / 2][3]);
+                s6 += ((h[l / 2 + 8] & hm[2]) ? 0.f : yl[l + 24]) + ((h[l / 2 + 8] & hm[3]) ? 0.f : yl[l + 25]);
+            }
+            d1 = d_all * (s1 + 1.f / 256.f * s2 - s3 * v1);
+            d2 = d_all * (s4 + 1.f / 256.f * s5 - s6 * v2);
+            sumf1[row] += d1 * (scales[1] - 32); sumf2[row] += d2 * (scales[3] - 32);
+            q += row_bytes / 2; h += row_bytes / 2; a += row_bytes / 2; dh += row_bytes / 2;
+        }
+        y1 += 4 * 256;
+    }
+    for (int row = 0; row < nr0; ++row) sumf1[row] = simd_sum((sumf1[row] + 0.25f * sumf2[row]) / (1 << shift));
+    if (tiisg == 0) for (int row = 0; row < nr0 && first_row + row < out; ++row) dst[first_row + row] = sumf1[row];
+}
+
+kernel void q3k_gemv(constant ggml_metal_kargs_mul_mv &args [[buffer(3)]],
+                     device const char *src0 [[buffer(0)]], device const char *src1 [[buffer(1)]],
+                     device char *dst [[buffer(2)]], uint3 tgpig [[threadgroup_position_in_grid]],
+                     ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short nr0 = 2; constexpr short NSG = 2;
+    const int first_row = (tgpig.x * NSG + sgitg) * nr0;
+    const uint64_t row_bytes = args.nb01;
+    device const block_q3_K *x = (device const block_q3_K *)(src0 + first_row * row_bytes);
+    device const float *y = (device const float *)src1;
+    q3k_gemv_impl<nr0>(x, y, (device float *)dst, args.ne00, args.ne0, row_bytes, first_row, tiisg);
+}
 
 kernel void rmsnorm(device const float *x [[buffer(0)]], device const float *w [[buffer(1)]],
                     device float *out [[buffer(2)]], constant Norm &p [[buffer(3)]],
@@ -425,8 +522,6 @@ kernel void route_topk(device const float *route [[buffer(0)]], device uint *ids
 kernel void NAME(device const uchar *w [[buffer(0)]], device const float *x [[buffer(1)]], device float *y [[buffer(2)]], constant ExpertGemv &p [[buffer(3)]], device const uint *ids [[buffer(4)]], ushort tid [[thread_index_in_threadgroup]], uint3 tgpig [[threadgroup_position_in_grid]], threadgroup float *sum [[threadgroup(0)]]) { \
     uint row=tgpig.x,slot=tgpig.z; float v=0; if(row<p.out) { device const uchar *r=w+uint64_t(ids[slot])*p.expert_stride+row*(p.in/256)*BYTES; device const float *input=x+slot*p.input_stride; for(uint j=tid;j<p.in;j+=256) v+=k_weight(r+(j/256)*BYTES,TYPE,j%256)*input[j]; } sum[tid]=v; threadgroup_barrier(mem_flags::mem_threadgroup); for(uint step=128;step;step>>=1){if(tid<step)sum[tid]+=sum[tid+step];threadgroup_barrier(mem_flags::mem_threadgroup);} if(!tid&&row<p.out)y[slot*p.out_stride+row]=sum[0]; \
 }
-EXPERT_K_GEMV(expert_q3k_gemv, 1, 110)
-
 kernel void expert_q4k_gemv(
         device const char *w [[buffer(0)]], device const float *input [[buffer(1)]],
         device float *output [[buffer(2)]], constant ExpertGemv &p [[buffer(3)]],
@@ -499,6 +594,21 @@ kernel void expert_q4k_gemv(
         float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0) output[slot * p.out_stride + first_row + row] = sum_all;
     }
+}
+
+kernel void expert_q3k_gemv(
+        device const char *w [[buffer(0)]], device const float *input [[buffer(1)]],
+        device float *output [[buffer(2)]], constant ExpertGemv &p [[buffer(3)]],
+        device const uint *ids [[buffer(4)]], uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short nr0 = 2; constexpr short NSG = 2;
+    const int slot = tgpig.z;
+    const int first_row = (tgpig.x * NSG + sgitg) * nr0;
+    const uint64_t row_bytes = (uint64_t)(p.in / 256) * sizeof(block_q3_K);
+    device const block_q3_K *x = (device const block_q3_K *)(w + (uint64_t)ids[slot] * p.expert_stride + first_row * row_bytes);
+    q3k_gemv_impl<nr0>(x, input + slot * p.input_stride, output + slot * p.out_stride,
+                        p.in, p.out, row_bytes, first_row, tiisg);
 }
 
 kernel void moe_add(device float *x [[buffer(0)]], device const float *expert [[buffer(1)]],

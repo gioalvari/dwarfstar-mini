@@ -41,16 +41,16 @@ attention buffers use their derived widths (`heads * key_length` and
 | Gate | Result |
 | --- | --- |
 | Asymmetric CPU vs Metal first prompt logits | max abs `4.20e-05`; argmax `12095` on both |
-| Asymmetric greedy, France `-n 16` | DSM Metal exactly matches `llama-simple` continuation |
+| Asymmetric greedy, France `-n 32` | DSM Metal exactly matches `llama-simple` continuation |
 | Asymmetric greedy, Fibonacci `-n 32` | DSM Metal exactly matches `llama-simple` continuation |
 | 1.7B Q4_K_M long prompt, `-n 128` | CPU and Metal output exactly matches |
 | `make test` | passed |
+| `check-metal-gemv`, Q3_K/Q4_K and expert slices | all relative errors below `1e-3` |
 | `dsm serve` + one Metal curl | passed; chat completion returned |
 
 | Model / backend | Decode tok/s |
 | --- | ---: |
-| 30B asymmetric, DSM Metal, France `-n 16` | 15.58 |
-| 30B asymmetric, DSM Metal, Fibonacci `-n 32` | 16.68 |
+| 30B asymmetric, DSM Metal, France `-n 32` | 45.92 |
 | 30B asymmetric, llama.cpp Metal, France | 64.41 |
 | 30B asymmetric, llama.cpp Metal, Fibonacci | 60.07 |
 
@@ -69,7 +69,28 @@ eight SwiGLU activations, and combines all weighted down outputs in one kernel.
 It has no CPU round trip. This reduces normal asymmetric France decode from
 16.92 tok/s before batching to 20.64 tok/s; Fibonacci `-n 32` measures 20.96
 tok/s. The Q3_K expert GEMV remains the simple compatible kernel; the profile
-identifies it as the next kernel-level target.
+identified it as the next kernel-level target.
+
+## K-quantized expert GEMVs
+
+The Q4_K down-expert path now reuses the dense Q4_K GEMV geometry: each
+two-simdgroup threadgroup computes four output rows, with the selected
+expert's byte stride applied before the row offset. Q3_K uses the faithful
+llama.cpp two-row/two-simdgroup kernel for both dense matrices and routed
+gate/up experts. The GEMV check tool accepts an optional tensor name and
+expert id, so an individual 3D expert slice can be compared against the CPU:
+
+```sh
+./check-metal-gemv models/Qwen3-30B-A3B-asym.gguf \
+  blk.0.ffn_down_exps.weight 0
+```
+
+On the M4 Pro, a profile run for the asymmetric France prompt (`-n 16`)
+reports `5.387 ms/token` for Q3_K expert gate/up and `2.753 ms/token` for
+Q4_K expert down. Profile categories synchronize separately and therefore
+are diagnostic only. The corresponding normal France decode (`-n 32`) is
+`45.92 tok/s`, faster than the preceding `20.64 tok/s` baseline; normal
+decode is the acceptance metric.
 
 The 32.48 GB Q8_0 model was not run through the final full-GPU comparison:
 this M4 Pro has 48 GB unified memory, but the model is larger than the device's
