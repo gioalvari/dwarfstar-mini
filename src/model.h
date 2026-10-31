@@ -11,6 +11,7 @@ typedef struct {
 typedef struct {
     gguf_file gguf;
     uint32_t layers, context, dim, hidden, heads, kv_heads, key_dim, value_dim, vocab;
+    uint32_t q_width, attn_width;
     uint32_t experts, experts_used, expert_hidden;
     int is_moe;
     float rope_base, rms_eps;

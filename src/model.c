@@ -59,11 +59,13 @@ int dsm_model_open(dsm_model *m, const char *path) {
         (m->is_moe && (!metadata_bool(&m->gguf, "qwen3moe.expert_weights_norm", 1) ||
                        !metadata_bool(&m->gguf, "qwen3moe.norm_top_k_prob", 1))) ||
         (m->is_moe && (!m->experts || !m->experts_used || m->experts_used > m->experts)) ||
-        !m->layers || m->heads % m->kv_heads || m->dim != m->heads * m->key_dim || m->key_dim != m->value_dim) {
+        !m->layers || m->heads % m->kv_heads || m->key_dim != m->value_dim) {
         fail(m, "unsupported or invalid Qwen3 metadata"); goto bad;
     }
 #undef META_U32
 #undef META_F32
+    m->q_width = m->heads * m->key_dim;
+    m->attn_width = m->heads * m->value_dim;
     m->token_embd = gguf_tensor_find(&m->gguf, "token_embd.weight");
     m->output_norm = gguf_tensor_find(&m->gguf, "output_norm.weight");
     m->output = gguf_tensor_find(&m->gguf, "output.weight");
@@ -89,8 +91,8 @@ int dsm_model_open(dsm_model *m, const char *path) {
             l->down = need(m, "blk.%u.ffn_down.weight", i);
         }
         if (!l->attn_norm || !l->q || !l->k || !l->v || !l->o || !l->q_norm || !l->k_norm || !l->ffn_norm ||
-            !vector(l->attn_norm, m->dim) || !matrix(l->q, m->dim, m->dim) || !matrix(l->k, m->dim, m->kv_heads * m->key_dim) ||
-            !matrix(l->v, m->dim, m->kv_heads * m->value_dim) || !matrix(l->o, m->dim, m->dim) || !vector(l->q_norm, m->key_dim) ||
+            !vector(l->attn_norm, m->dim) || !matrix(l->q, m->dim, m->q_width) || !matrix(l->k, m->dim, m->kv_heads * m->key_dim) ||
+            !matrix(l->v, m->dim, m->kv_heads * m->value_dim) || !matrix(l->o, m->attn_width, m->dim) || !vector(l->q_norm, m->key_dim) ||
             !vector(l->k_norm, m->key_dim) || !vector(l->ffn_norm, m->dim) ||
             (!m->is_moe && (!matrix(l->gate, m->dim, m->hidden) || !matrix(l->up, m->dim, m->hidden) || !matrix(l->down, m->hidden, m->dim))) ||
             (m->is_moe && (!matrix(l->gate_inp, m->dim, m->experts) ||
