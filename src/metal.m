@@ -197,8 +197,12 @@ static void encode_expert_gemv(dsm_metal *s, id<MTLComputeCommandEncoder> e,
     [e setComputePipelineState:state]; [e setBuffer:wb offset:(NSUInteger)off atIndex:0];
     [e setBuffer:x offset:0 atIndex:1]; [e setBuffer:y offset:0 atIndex:2];
     [e setBytes:&p length:sizeof(p) atIndex:3]; [e setBuffer:s->expert_ids offset:0 atIndex:4];
-    [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
-    [e dispatchThreadgroups:MTLSizeMake(p.out, 1, s->m->experts_used) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    if (w->type == GGML_TYPE_Q4_K) {
+        [e dispatchThreadgroups:MTLSizeMake((p.out + 3) / 4, 1, s->m->experts_used) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+    } else {
+        [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
+        [e dispatchThreadgroups:MTLSizeMake(p.out, 1, s->m->experts_used) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
 }
 static void encode_moe_router(dsm_metal *s, id<MTLComputeCommandEncoder> e, const dsm_layer *w) {
     encode_gemv(s, e, w->gate_inp, s->norm_x, s->route);
@@ -230,8 +234,7 @@ static void encode_moe_down(dsm_metal *s, id<MTLComputeCommandEncoder> e, const 
     [e setComputePipelineState:s->expert_q4k]; [e setBuffer:wb offset:(NSUInteger)off atIndex:0];
     [e setBuffer:s->gate offset:0 atIndex:1]; [e setBuffer:s->tmp offset:0 atIndex:2];
     [e setBytes:&p length:sizeof(p) atIndex:3]; [e setBuffer:s->expert_ids offset:0 atIndex:4];
-    [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
-    [e dispatchThreadgroups:MTLSizeMake(p.out, 1, m->experts_used) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e dispatchThreadgroups:MTLSizeMake((p.out + 3) / 4, 1, m->experts_used) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
 }
 static void encode_moe_accumulate(dsm_metal *s, id<MTLComputeCommandEncoder> e) {
     const dsm_model *m = s->m;
@@ -266,6 +269,16 @@ void dsm_metal_free(dsm_metal *s){if(!s)return;if(s->profile.enabled)dsm_metal_p
 uint32_t dsm_metal_pos(const dsm_metal *s){return s->pos;}
 int dsm_metal_truncate(dsm_metal *s,uint32_t pos){if(!s||pos>s->pos)return 0;s->pos=pos;return 1;}
 int dsm_metal_matvec_test(dsm_metal *s,const gguf_tensor *w,const float *input,float *output){if(!s||!w||!dsm_quant_supported(w->type))return 0;id<MTLBuffer> x=buffer(s->device,w->dims[0]*sizeof(float)),y=buffer(s->device,w->dims[1]*sizeof(float));if(!x||!y)return 0;memcpy(x.contents,input,w->dims[0]*sizeof(float));id<MTLCommandBuffer> cb=[s->queue commandBuffer];id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];encode_gemv(s,e,w,x,y);[e endEncoding];[cb commit];[cb waitUntilCompleted];if(cb.status!=MTLCommandBufferStatusCompleted)return 0;memcpy(output,y.contents,w->dims[1]*sizeof(float));return 1;}
+int dsm_metal_expert_matvec_test(dsm_metal *s,const gguf_tensor *w,uint32_t expert,const float *input,float *output){
+    if(!s||!w||w->type!=GGML_TYPE_Q4_K||w->ndim!=3||expert>=w->dims[2])return 0;
+    id<MTLBuffer> wb,x,y,ids;uint64_t off;if(!tensor_view(s,w,&wb,&off))return 0;
+    x=buffer(s->device,w->dims[0]*sizeof(float));y=buffer(s->device,w->dims[1]*sizeof(float));ids=buffer(s->device,sizeof(expert));if(!x||!y||!ids)return 0;
+    memcpy(x.contents,input,w->dims[0]*sizeof(float));memcpy(ids.contents,&expert,sizeof(expert));
+    expert_gemv_params p={(uint32_t)w->dims[0],(uint32_t)w->dims[1],(uint32_t)(w->bytes/w->dims[2]),(uint32_t)w->dims[1],0};
+    id<MTLCommandBuffer> cb=[s->queue commandBuffer];id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+    [e setComputePipelineState:s->expert_q4k];[e setBuffer:wb offset:(NSUInteger)off atIndex:0];[e setBuffer:x offset:0 atIndex:1];[e setBuffer:y offset:0 atIndex:2];[e setBytes:&p length:sizeof(p) atIndex:3];[e setBuffer:ids offset:0 atIndex:4];[e dispatchThreadgroups:MTLSizeMake((p.out+3)/4,1,1) threadsPerThreadgroup:MTLSizeMake(32,2,1)];
+    [e endEncoding];[cb commit];[cb waitUntilCompleted];if(cb.status!=MTLCommandBufferStatusCompleted)return 0;memcpy(output,y.contents,w->dims[1]*sizeof(float));return 1;
+}
 static int profile_layer(dsm_metal *s, const dsm_layer *w, uint32_t layer, uint32_t kvw) {
     const dsm_model *m=s->m; id<MTLCommandBuffer> cb; id<MTLComputeCommandEncoder> e; double start;
 #define PROFILE_ENCODE(category, count, bytes, body) do { \

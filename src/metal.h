@@ -16,5 +16,8 @@ uint32_t dsm_metal_pos(const dsm_metal *state);
 int dsm_metal_truncate(dsm_metal *state, uint32_t pos);
 int dsm_metal_matvec_test(dsm_metal *state, const gguf_tensor *weights,
                           const float *input, float *output);
+int dsm_metal_expert_matvec_test(dsm_metal *state, const gguf_tensor *weights,
+                                 uint32_t expert, const float *input,
+                                 float *output);
 
 #endif
