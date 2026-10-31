@@ -64,7 +64,7 @@ inline float k_weight(device const uchar *b, uint type, uint i) {
 }
 #define K_GEMV(NAME, TYPE, BYTES) \
 kernel void NAME(device const uchar *w [[buffer(0)]], device const float *x [[buffer(1)]], device float *y [[buffer(2)]], constant Gemv &p [[buffer(3)]], ushort tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]], threadgroup float *sum [[threadgroup(0)]]) { \
-    float v=0; if(row<p.out) { device const uchar *r=w+row*(p.in/256)*BYTES; for(uint b=tid;b<p.in/256;b+=256) for(uint z=0;z<256;++z) v+=k_weight(r+b*BYTES,TYPE,z)*x[b*256+z]; } sum[tid]=v; threadgroup_barrier(mem_flags::mem_threadgroup); for(uint step=128;step;step>>=1){if(tid<step)sum[tid]+=sum[tid+step];threadgroup_barrier(mem_flags::mem_threadgroup);} if(!tid&&row<p.out)y[row]=sum[0]; }
+    float v=0; if(row<p.out) { device const uchar *r=w+row*(p.in/256)*BYTES; for(uint j=tid;j<p.in;j+=256) v+=k_weight(r+(j/256)*BYTES,TYPE,j%256)*x[j]; } sum[tid]=v; threadgroup_barrier(mem_flags::mem_threadgroup); for(uint step=128;step;step>>=1){if(tid<step)sum[tid]+=sum[tid+step];threadgroup_barrier(mem_flags::mem_threadgroup);} if(!tid&&row<p.out)y[row]=sum[0]; }
 K_GEMV(q2k_gemv, 0, 84)
 K_GEMV(q3k_gemv, 1, 110)
 K_GEMV(q4k_gemv, 2, 144)
@@ -94,19 +94,22 @@ kernel void cache_write(device const float *src [[buffer(0)]], device float *cac
 }
 
 kernel void attention_decode(device const float *q [[buffer(0)]], device const float *keys [[buffer(1)]],
-                             device const float *values [[buffer(2)]], device float *out [[buffer(3)]],
-                             device float *scores [[buffer(4)]], constant Attention &p [[buffer(5)]],
-                             ushort tid [[thread_index_in_threadgroup]], uint head [[threadgroup_position_in_grid]]) {
-    if (head >= p.heads) return; uint kvh = head / (p.heads / p.kv_heads); uint width = p.kv_heads * p.dim;
-    /* Each output lane recomputes the small decode softmax. This avoids an
-       inter-threadgroup global-memory dependency and is correctness-first. */
-    for (uint j = tid; j < p.dim; j += 256) {
-        float maxv = -INFINITY;
-        for (uint pos = 0; pos <= p.pos; ++pos) { const device float *k = keys + ((p.layer * p.context + pos) * width + kvh * p.dim); float d = 0; for (uint z = 0; z < p.dim; ++z) d += q[head * p.dim + z] * k[z]; maxv = max(maxv, d * rsqrt(float(p.dim))); }
-        float sum = 0, value = 0;
-        for (uint pos = 0; pos <= p.pos; ++pos) { const device float *k = keys + ((p.layer * p.context + pos) * width + kvh * p.dim); float d = 0; for (uint z = 0; z < p.dim; ++z) d += q[head * p.dim + z] * k[z]; float pscore = exp(d * rsqrt(float(p.dim)) - maxv); sum += pscore; value += pscore * values[((p.layer * p.context + pos) * width + kvh * p.dim + j)]; }
-        out[head * p.dim + j] = value / sum;
-    }
+                              device const float *values [[buffer(2)]], device float *out [[buffer(3)]],
+                              device float *scores [[buffer(4)]], constant Attention &p [[buffer(5)]],
+                              ushort tid [[thread_index_in_threadgroup]], uint head [[threadgroup_position_in_grid]],
+                              threadgroup float *reduce [[threadgroup(0)]]) {
+    if (head >= p.heads) return; uint kvh = head / (p.heads / p.kv_heads), width = p.kv_heads * p.dim;
+    device float *head_scores = scores + head * p.context;
+    float local_max = -INFINITY;
+    for (uint pos = tid; pos <= p.pos; pos += 256) { const device float *k = keys + ((p.layer * p.context + pos) * width + kvh * p.dim); float dot = 0; for (uint z = 0; z < p.dim; ++z) dot += q[head * p.dim + z] * k[z]; float score = dot * rsqrt(float(p.dim)); head_scores[pos] = score; local_max = max(local_max, score); }
+    reduce[tid] = local_max; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) { if (tid < step) reduce[tid] = max(reduce[tid], reduce[tid + step]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float maxv = reduce[0], local_sum = 0;
+    for (uint pos = tid; pos <= p.pos; pos += 256) { float value = exp(head_scores[pos] - maxv); head_scores[pos] = value; local_sum += value; }
+    reduce[tid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) { if (tid < step) reduce[tid] += reduce[tid + step]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float inv_sum = 1.0f / reduce[0];
+    for (uint j = tid; j < p.dim; j += 256) { float value = 0; for (uint pos = 0; pos <= p.pos; ++pos) value += head_scores[pos] * inv_sum * values[((p.layer * p.context + pos) * width + kvh * p.dim + j)]; out[head * p.dim + j] = value; }
 }
 
 kernel void add_inplace(device float *x [[buffer(0)]], device const float *y [[buffer(1)]], constant uint &n [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i < n) x[i] += y[i]; }
