@@ -1,4 +1,5 @@
 #include "model.h"
+#include "quants.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,7 +13,7 @@ static const gguf_tensor *need(dsm_model *m, const char *format, uint32_t layer)
 }
 static int matrix(const gguf_tensor *t, uint64_t in, uint64_t out) {
     return t && t->ndim == 2 && t->dims[0] == in && t->dims[1] == out &&
-           (t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_F32);
+           dsm_quant_supported(t->type);
 }
 static int vector(const gguf_tensor *t, uint64_t n) {
     return t && t->ndim == 1 && t->dims[0] == n && t->type == GGML_TYPE_F32;
@@ -40,7 +41,7 @@ int dsm_model_open(dsm_model *m, const char *path) {
     m->output = gguf_tensor_find(&m->gguf, "output.weight");
     if (!m->output) m->output = m->token_embd;
     if (!m->token_embd || m->token_embd->ndim != 2 || m->token_embd->dims[0] != m->dim ||
-        m->token_embd->type != GGML_TYPE_Q8_0 || !vector(m->output_norm, m->dim) ||
+        !dsm_quant_supported(m->token_embd->type) || !vector(m->output_norm, m->dim) ||
         !matrix(m->output, m->dim, m->token_embd->dims[1])) { fail(m, "invalid embedding or output tensor"); goto bad; }
     m->vocab = (uint32_t)m->token_embd->dims[1];
     m->layer = calloc(m->layers, sizeof(*m->layer)); if (!m->layer) { fail(m, "out of memory"); goto bad; }

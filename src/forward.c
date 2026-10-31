@@ -1,4 +1,5 @@
 #include "forward.h"
+#include "quants.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -11,11 +12,11 @@ struct dsm_forward {
 };
 static float f16(uint16_t h) { union { uint32_t u; float f; } u; unsigned sign=h>>15, exp=(h>>10)&31, frac=h&1023; if(!exp) u.u=sign<<31; else if(exp==31) u.u=(sign<<31)|0x7f800000|(frac<<13); else u.u=(sign<<31)|((exp+112)<<23)|(frac<<13); return u.f; }
 static float weight_at(const gguf_tensor *w, uint64_t row, uint64_t col) {
-    if(w->type==GGML_TYPE_F32) return ((const float *)w->data)[row*w->dims[0]+col];
-    const uint8_t *p=(const uint8_t *)w->data+(row*w->dims[0]+col)/32*34; return f16(*(const uint16_t *)p)*(float)(int8_t)p[2+(col&31)];
+    const ggml_type_info *info=gguf_type_info(w->type); float out[256]; uint64_t block=col/info->block_elems;
+    dsm_dequant_row(w->type,(const uint8_t *)w->data+(row*(w->dims[0]/info->block_elems)+block)*info->block_bytes,out,info->block_elems); return out[col%info->block_elems];
 }
 static void matvec(const gguf_tensor *w, const float *x, float *y) {
-    uint64_t in=w->dims[0], out=w->dims[1]; for(uint64_t r=0;r<out;++r) { float sum=0; if(w->type==GGML_TYPE_Q8_0) { const uint8_t *p=(const uint8_t *)w->data+r*(in/32)*34; for(uint64_t j=0;j<in;j+=32,p+=34) { float d=f16(*(const uint16_t *)p); for(unsigned k=0;k<32;++k) sum+=(float)(int8_t)p[2+k]*x[j+k]*d; } } else for(uint64_t j=0;j<in;++j) sum+=weight_at(w,r,j)*x[j]; y[r]=sum; }
+    uint64_t in=w->dims[0], out=w->dims[1]; const ggml_type_info *info=gguf_type_info(w->type); uint64_t bytes=in/info->block_elems*info->block_bytes; for(uint64_t r=0;r<out;++r) y[r]=dsm_dot_row(w->type,(const uint8_t *)w->data+r*bytes,x,in);
 }
 static void rmsnorm(float *out,const float *in,const gguf_tensor *weight,uint32_t n,float eps) { float ss=0;for(uint32_t i=0;i<n;++i)ss+=in[i]*in[i]; float scale=1.0f/sqrtf(ss/n+eps); const float *w=weight?(const float *)weight->data:NULL;for(uint32_t i=0;i<n;++i)out[i]=in[i]*scale*(w?w[i]:1); }
 static void rope(float *x,uint32_t heads,uint32_t dim,uint32_t pos,float base) { for(uint32_t h=0;h<heads;++h)for(uint32_t i=0;i<dim/2;++i){float a=x[h*dim+i],b=x[h*dim+i+dim/2],theta=(float)pos/powf(base,(float)i/(dim/2));float c=cosf(theta),s=sinf(theta);x[h*dim+i]=a*c-b*s;x[h*dim+i+dim/2]=a*s+b*c;} }
