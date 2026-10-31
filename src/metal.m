@@ -164,6 +164,9 @@ static void encode_gemv(dsm_metal *s, id<MTLComputeCommandEncoder> e, const gguf
         [e setBytes:&mul_mv length:sizeof(mul_mv) atIndex:3];
         [e setThreadgroupMemoryLength:32 * sizeof(float) * 2 atIndex:0];
         [e dispatchThreadgroups:MTLSizeMake((p.out + 1) / 2, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+    } else if (w->type == GGML_TYPE_Q4_K) {
+        [e setBytes:&mul_mv length:sizeof(mul_mv) atIndex:3];
+        [e dispatchThreadgroups:MTLSizeMake((p.out + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
     } else {
         [e setBytes:&p length:sizeof(p) atIndex:3];
         [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0]; [e dispatchThreadgroups:MTLSizeMake(p.out, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
