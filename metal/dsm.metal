@@ -1,27 +1,87 @@
 #include <metal_stdlib>
 using namespace metal;
 
+struct ggml_metal_kargs_mul_mv {
+    int ne00, ne01, ne02;
+    ulong nb00, nb01, nb02, nb03;
+    int ne10, ne11, ne12;
+    ulong nb10, nb11, nb12, nb13;
+    int ne0, ne1, nr0;
+    short r2, r3;
+};
 struct Gemv { uint in, out; };
 struct Norm { uint width, groups; float eps; };
 struct Rope { uint heads, dim, pos; float base; };
 struct Cache { uint layer, pos, context, width; };
 struct Attention { uint heads, kv_heads, dim, pos, context, layer; };
 
-kernel void q8_gemv(device const uchar *w [[buffer(0)]], device const float *x [[buffer(1)]],
-                    device float *y [[buffer(2)]], constant Gemv &p [[buffer(3)]],
-                    ushort tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]],
-                    threadgroup float *sum [[threadgroup(0)]]) {
-    if (row >= p.out) return;
-    const device uchar *r = w + row * (p.in / 32) * 34;
-    float v = 0.0f;
-    for (uint j = tid; j < p.in; j += 256) {
-        uint block = j >> 5;
-        half d = as_type<half>(*reinterpret_cast<const device ushort *>(r + block * 34));
-        v += float(*reinterpret_cast<const device int8_t *>(r + block * 34 + 2 + (j & 31))) * x[j] * float(d);
+// Ported from llama.cpp ggml-metal/kernels/mul_mv.metal (MIT license).
+struct block_q8_0 { half d; char qs[32]; };
+
+template<short NR0>
+static inline void helper_mv_reduce_and_write(
+        device float *dst_f32, float sumf[NR0], const int r0, const int ne01,
+        ushort tiisg, ushort sgitg, threadgroup char *shmem) {
+    constexpr short NW = 32;
+    threadgroup float *shmem_f32[NR0];
+    for (short row = 0; row < NR0; ++row) {
+        shmem_f32[row] = (threadgroup float *)shmem + NW * row;
+        if (sgitg == 0) shmem_f32[row][tiisg] = 0.0f;
+        sumf[row] = simd_sum(sumf[row]);
     }
-    sum[tid] = v; threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint step = 128; step; step >>= 1) { if (tid < step) sum[tid] += sum[tid + step]; threadgroup_barrier(mem_flags::mem_threadgroup); }
-    if (!tid) y[row] = sum[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short row = 0; row < NR0; ++row) {
+        if (tiisg == 0) shmem_f32[row][sgitg] = sumf[row];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {
+        float tot = simd_sum(shmem_f32[row][tiisg]);
+        if (tiisg == 0 && sgitg == 0) dst_f32[r0 + row] = tot;
+    }
+}
+
+kernel void q8_gemv(
+        constant ggml_metal_kargs_mul_mv &args [[buffer(3)]],
+        device const char *src0 [[buffer(0)]], device const char *src1 [[buffer(1)]],
+        device char *dst [[buffer(2)]], threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = 2;
+    constexpr short NSG = 4;
+    constexpr short NW = 32;
+    constexpr short NQ = 8;
+    const int nb = args.ne00 / 32;
+    const int r0 = tgpig.x * NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+    const uint i12 = im;
+    const uint i13 = 0;
+    const uint64_t offset1 = r1 * args.nb11 + i12 * args.nb12 + i13 * args.nb13;
+    device const float *y = (device const float *)(src1 + offset1);
+    device const block_q8_0 *ax[NR0];
+    for (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row) * args.nb01 + i12 * args.nb02 + i13 * args.nb03;
+        ax[row] = (device const block_q8_0 *)(src0 + offset0);
+    }
+    float sumf[NR0] = {0.f};
+    const short ix = tiisg / (NW / NQ);
+    const short il = tiisg % (NW / NQ);
+    const int ib0 = sgitg * NQ + ix;
+    float yl[NQ];
+    device const float *yb = y + ib0 * 32 + il * NQ;
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        for (short i = 0; i < NQ; ++i) yl[i] = yb[i];
+        for (short row = 0; row < NR0; ++row) {
+            device const char *qs = ax[row][ib].qs + il * NQ;
+            float sumq = 0.f;
+            for (short i = 0; i < NQ; ++i) sumq += qs[i] * yl[i];
+            sumf[row] += sumq * ax[row][ib].d;
+        }
+        yb += NSG * NQ * 32;
+    }
+    device float *dst_f32 = (device float *)dst + (uint64_t)im * args.ne0 * args.ne1 + (uint64_t)r1 * args.ne0;
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
 kernel void f32_gemv(device const float *w [[buffer(0)]], device const float *x [[buffer(1)]],

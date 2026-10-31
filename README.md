@@ -8,3 +8,5 @@ asymmetric quantization -> OpenAI-compatible server. See `docs/ds4-notes.md`.
 
 Reference oracle: `../llama.cpp/build/bin` (Metal build).
 Model: `models/Qwen3-1.7B-Q8_0.gguf` (not committed).
+
+Metal GEMV kernel ports include code from llama.cpp, licensed under MIT.

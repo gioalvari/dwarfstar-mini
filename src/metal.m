@@ -13,6 +13,14 @@
 #include <unistd.h>
 
 typedef struct { uint32_t in, out; } gemv_params;
+typedef struct {
+    int32_t ne00, ne01, ne02;
+    uint64_t nb00, nb01, nb02, nb03;
+    int32_t ne10, ne11, ne12;
+    uint64_t nb10, nb11, nb12, nb13;
+    int32_t ne0, ne1, nr0;
+    int16_t r2, r3;
+} gemv_mul_mv_params;
 typedef struct { uint32_t width, groups; float eps; } norm_params;
 typedef struct { uint32_t heads, dim, pos; float base; } rope_params;
 typedef struct { uint32_t layer, pos, context, width; } cache_params;
@@ -135,6 +143,13 @@ static void dispatch_1d(id<MTLComputeCommandEncoder> e, id<MTLComputePipelineSta
 static void encode_gemv(dsm_metal *s, id<MTLComputeCommandEncoder> e, const gguf_tensor *w, id<MTLBuffer> x, id<MTLBuffer> y) {
     id<MTLBuffer> wb; uint64_t off; if (!tensor_view(s, w, &wb, &off)) return;
     gemv_params p = {(uint32_t)w->dims[0], (uint32_t)w->dims[1]};
+    gemv_mul_mv_params mul_mv = {
+        .ne00 = (int32_t)w->dims[0], .ne01 = (int32_t)w->dims[1], .ne02 = 1,
+        .nb00 = 0, .nb01 = w->bytes / w->dims[1], .nb02 = 0, .nb03 = 0,
+        .ne10 = (int32_t)w->dims[0], .ne11 = 1, .ne12 = 1,
+        .nb10 = sizeof(float), .nb11 = 0, .nb12 = 0, .nb13 = 0,
+        .ne0 = (int32_t)w->dims[1], .ne1 = 1, .nr0 = 0, .r2 = 1, .r3 = 1,
+    };
     id<MTLComputePipelineState> state = s->f32;
     switch (w->type) {
         case GGML_TYPE_Q8_0: state = s->q8; break;
@@ -144,8 +159,15 @@ static void encode_gemv(dsm_metal *s, id<MTLComputeCommandEncoder> e, const gguf
         case GGML_TYPE_Q5_K: state = s->q5k; break;
         case GGML_TYPE_Q6_K: state = s->q6k; break;
     }
-    [e setComputePipelineState:state]; [e setBuffer:wb offset:(NSUInteger)off atIndex:0]; [e setBuffer:x offset:0 atIndex:1]; [e setBuffer:y offset:0 atIndex:2]; [e setBytes:&p length:sizeof(p) atIndex:3];
-    [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0]; [e dispatchThreadgroups:MTLSizeMake(p.out, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e setComputePipelineState:state]; [e setBuffer:wb offset:(NSUInteger)off atIndex:0]; [e setBuffer:x offset:0 atIndex:1]; [e setBuffer:y offset:0 atIndex:2];
+    if (w->type == GGML_TYPE_Q8_0) {
+        [e setBytes:&mul_mv length:sizeof(mul_mv) atIndex:3];
+        [e setThreadgroupMemoryLength:32 * sizeof(float) * 2 atIndex:0];
+        [e dispatchThreadgroups:MTLSizeMake((p.out + 1) / 2, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+    } else {
+        [e setBytes:&p length:sizeof(p) atIndex:3];
+        [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0]; [e dispatchThreadgroups:MTLSizeMake(p.out, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
 }
 static void encode_norm(dsm_metal *s, id<MTLComputeCommandEncoder> e, id<MTLBuffer> x, const gguf_tensor *w, id<MTLBuffer> out, uint32_t width, uint32_t groups) {
     id<MTLBuffer> wb; uint64_t off; if (!tensor_view(s,w,&wb,&off)) return; norm_params p={width,groups,s->m->rms_eps};
