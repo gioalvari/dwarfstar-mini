@@ -1,0 +1,14 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "dwarfstar": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "dwarfstar-mini (local)",
+      "options": { "baseURL": "http://127.0.0.1:8080/v1" },
+      "models": {
+        "Qwen3-30B-A3B-asym": { "name": "Qwen3 30B-A3B asym (dsm)" },
+        "Qwen3-1.7B-Q8_0": { "name": "Qwen3 1.7B Q8_0 (dsm)" }
+      }
+    }
+  }
+}
