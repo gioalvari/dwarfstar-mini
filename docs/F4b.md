@@ -54,6 +54,23 @@ attention buffers use their derived widths (`heads * key_length` and
 | 30B asymmetric, llama.cpp Metal, France | 64.41 |
 | 30B asymmetric, llama.cpp Metal, Fibonacci | 60.07 |
 
+## MoE profile and dispatch batching
+
+With `DSM_PROFILE=1`, the asymmetric model profile now separates the router,
+GPU top-k, expert gate/up, expert down, and weighted accumulation stages. A
+short France run reports expert gate/up at 32.10 ms/token (16.17 GB/s) and
+expert down at 25.00 ms/token (13.59 GB/s); together they remain the principal
+decode cost. The profile runs each category in separate command buffers, so it
+is diagnostic-only and slower than normal decode.
+
+The normal path batches all eight selected experts in one dispatch per gate,
+up, and down projection (threadgroup `z` selects the expert slot), fuses the
+eight SwiGLU activations, and combines all weighted down outputs in one kernel.
+It has no CPU round trip. This reduces normal asymmetric France decode from
+16.92 tok/s before batching to 20.64 tok/s; Fibonacci `-n 32` measures 20.96
+tok/s. The Q3_K expert GEMV remains the simple compatible kernel; the profile
+identifies it as the next kernel-level target.
+
 The 32.48 GB Q8_0 model was not run through the final full-GPU comparison:
 this M4 Pro has 48 GB unified memory, but the model is larger than the device's
 recommended working set after runtime/KV allocations. It is intentionally

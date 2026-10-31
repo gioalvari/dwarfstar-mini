@@ -398,7 +398,7 @@ kernel void attention_decode(device const float *q [[buffer(0)]], device const f
 kernel void add_inplace(device float *x [[buffer(0)]], device const float *y [[buffer(1)]], constant uint &n [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i < n) x[i] += y[i]; }
 kernel void swiglu(device float *gate [[buffer(0)]], device const float *up [[buffer(1)]], constant uint &n [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i < n) { float x=gate[i]; gate[i]=(x/(1.0f+exp(-x)))*up[i]; } }
 
-struct ExpertGemv { uint in, out, expert_stride, slot; };
+struct ExpertGemv { uint in, out, expert_stride, out_stride, input_stride; };
 
 kernel void route_topk(device const float *route [[buffer(0)]], device uint *ids [[buffer(1)]],
                        device float *weights [[buffer(2)]], constant uint &experts [[buffer(3)]],
@@ -422,14 +422,20 @@ kernel void route_topk(device const float *route [[buffer(0)]], device uint *ids
 }
 
 #define EXPERT_K_GEMV(NAME, TYPE, BYTES) \
-kernel void NAME(device const uchar *w [[buffer(0)]], device const float *x [[buffer(1)]], device float *y [[buffer(2)]], constant ExpertGemv &p [[buffer(3)]], device const uint *ids [[buffer(4)]], ushort tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]], threadgroup float *sum [[threadgroup(0)]]) { \
-    float v=0; if(row<p.out) { device const uchar *r=w+uint64_t(ids[p.slot])*p.expert_stride+row*(p.in/256)*BYTES; for(uint j=tid;j<p.in;j+=256) v+=k_weight(r+(j/256)*BYTES,TYPE,j%256)*x[j]; } sum[tid]=v; threadgroup_barrier(mem_flags::mem_threadgroup); for(uint step=128;step;step>>=1){if(tid<step)sum[tid]+=sum[tid+step];threadgroup_barrier(mem_flags::mem_threadgroup);} if(!tid&&row<p.out)y[row]=sum[0]; \
+kernel void NAME(device const uchar *w [[buffer(0)]], device const float *x [[buffer(1)]], device float *y [[buffer(2)]], constant ExpertGemv &p [[buffer(3)]], device const uint *ids [[buffer(4)]], ushort tid [[thread_index_in_threadgroup]], uint3 tgpig [[threadgroup_position_in_grid]], threadgroup float *sum [[threadgroup(0)]]) { \
+    uint row=tgpig.x,slot=tgpig.z; float v=0; if(row<p.out) { device const uchar *r=w+uint64_t(ids[slot])*p.expert_stride+row*(p.in/256)*BYTES; device const float *input=x+slot*p.input_stride; for(uint j=tid;j<p.in;j+=256) v+=k_weight(r+(j/256)*BYTES,TYPE,j%256)*input[j]; } sum[tid]=v; threadgroup_barrier(mem_flags::mem_threadgroup); for(uint step=128;step;step>>=1){if(tid<step)sum[tid]+=sum[tid+step];threadgroup_barrier(mem_flags::mem_threadgroup);} if(!tid&&row<p.out)y[slot*p.out_stride+row]=sum[0]; \
 }
 EXPERT_K_GEMV(expert_q3k_gemv, 1, 110)
 EXPERT_K_GEMV(expert_q4k_gemv, 2, 144)
 
 kernel void moe_add(device float *x [[buffer(0)]], device const float *expert [[buffer(1)]],
-                    device const float *weights [[buffer(2)]], constant uint &slot [[buffer(3)]],
+                    device const float *weights [[buffer(2)]], constant uint &slots [[buffer(3)]],
                     constant uint &n [[buffer(4)]], uint i [[thread_position_in_grid]]) {
-    if (i < n) x[i] += weights[slot] * expert[i];
+    if (i < n) { float value=0; for(uint slot=0;slot<slots;++slot)value+=weights[slot]*expert[slot*n+i]; x[i]+=value; }
+}
+
+kernel void expert_swiglu(device float *gate [[buffer(0)]], device const float *up [[buffer(1)]],
+                          constant uint &width [[buffer(2)]], constant uint &slots [[buffer(3)]],
+                          uint i [[thread_position_in_grid]]) {
+    if (i < width*slots) { float x=gate[i]; gate[i]=(x/(1.0f+exp(-x)))*up[i]; }
 }

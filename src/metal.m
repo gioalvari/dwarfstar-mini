@@ -25,7 +25,7 @@ typedef struct { uint32_t width, groups; float eps; } norm_params;
 typedef struct { uint32_t heads, dim, pos; float base; } rope_params;
 typedef struct { uint32_t layer, pos, context, width; } cache_params;
 typedef struct { uint32_t heads, kv_heads, dim, pos, context, layer; } attn_params;
-typedef struct { uint32_t in, out, expert_stride, slot; } expert_gemv_params;
+typedef struct { uint32_t in, out, expert_stride, out_stride, input_stride; } expert_gemv_params;
 
 typedef struct { id<MTLBuffer> buffer; uint64_t file_offset, bytes; } weight_view;
 typedef enum {
@@ -34,6 +34,11 @@ typedef enum {
     PROFILE_KV_STORE,
     PROFILE_ATTENTION,
     PROFILE_O_GEMV,
+    PROFILE_MOE_ROUTER,
+    PROFILE_MOE_TOPK,
+    PROFILE_MOE_EXPERT_GATE_UP,
+    PROFILE_MOE_EXPERT_DOWN,
+    PROFILE_MOE_ACCUMULATE,
     PROFILE_FFN_GATE_UP_GEMV,
     PROFILE_SWIGLU,
     PROFILE_FFN_DOWN_GEMV,
@@ -52,7 +57,7 @@ typedef struct {
 struct dsm_metal {
     const dsm_model *m; uint32_t pos, context, n_views;
     id<MTLDevice> device; id<MTLCommandQueue> queue;
-    id<MTLComputePipelineState> q8, q2k, q3k, q4k, q5k, q6k, f32, norm, rope, cache, attention, add, swiglu, route_topk, expert_q3k, expert_q4k, moe_add;
+    id<MTLComputePipelineState> q8, q2k, q3k, q4k, q5k, q6k, f32, norm, rope, cache, attention, add, swiglu, route_topk, expert_q3k, expert_q4k, expert_swiglu, moe_add;
     weight_view *views;
     id<MTLBuffer> x, norm_x, q, k, v, att, tmp, gate, up, route, expert_ids, expert_weights, scores, keys, values, logits;
     dsm_metal_profile profile;
@@ -103,6 +108,7 @@ static int profile_complete(dsm_metal *s, profile_category category, id<MTLComma
 static void dsm_metal_profile_print(const dsm_metal *s) {
     static const char *names[PROFILE_CATEGORY_COUNT] = {
         "qkv_gemv", "qk_norm_rope", "kv_store", "attention", "o_gemv",
+        "moe_router", "moe_topk", "moe_expert_gate_up", "moe_expert_down", "moe_accumulate",
         "ffn_gate_up_gemv", "swiglu", "ffn_down_gemv", "rmsnorm", "residual",
         "output_gemv", "other",
     };
@@ -182,37 +188,61 @@ static void encode_gemv(dsm_metal *s, id<MTLComputeCommandEncoder> e, const gguf
 }
 static void encode_expert_gemv(dsm_metal *s, id<MTLComputeCommandEncoder> e,
                                const gguf_tensor *w, id<MTLBuffer> x,
-                               id<MTLBuffer> y, uint32_t slot) {
+                               id<MTLBuffer> y) {
     id<MTLBuffer> wb; uint64_t off;
     if (!tensor_view(s, w, &wb, &off)) return;
     id<MTLComputePipelineState> state = w->type == GGML_TYPE_Q3_K ? s->expert_q3k : s->expert_q4k;
     expert_gemv_params p = {(uint32_t)w->dims[0], (uint32_t)w->dims[1],
-                             (uint32_t)(w->bytes / w->dims[2]), slot};
+                             (uint32_t)(w->bytes / w->dims[2]), (uint32_t)w->dims[1], 0};
     [e setComputePipelineState:state]; [e setBuffer:wb offset:(NSUInteger)off atIndex:0];
     [e setBuffer:x offset:0 atIndex:1]; [e setBuffer:y offset:0 atIndex:2];
     [e setBytes:&p length:sizeof(p) atIndex:3]; [e setBuffer:s->expert_ids offset:0 atIndex:4];
     [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
-    [e dispatchThreadgroups:MTLSizeMake(p.out, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e dispatchThreadgroups:MTLSizeMake(p.out, 1, s->m->experts_used) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
-static void encode_moe(dsm_metal *s, id<MTLComputeCommandEncoder> e, const dsm_layer *w) {
-    const dsm_model *m = s->m;
+static void encode_moe_router(dsm_metal *s, id<MTLComputeCommandEncoder> e, const dsm_layer *w) {
     encode_gemv(s, e, w->gate_inp, s->norm_x, s->route);
+}
+static void encode_moe_topk(dsm_metal *s, id<MTLComputeCommandEncoder> e) {
+    const dsm_model *m = s->m;
     [e setComputePipelineState:s->route_topk]; [e setBuffer:s->route offset:0 atIndex:0];
     [e setBuffer:s->expert_ids offset:0 atIndex:1]; [e setBuffer:s->expert_weights offset:0 atIndex:2];
     [e setBytes:&m->experts length:sizeof(m->experts) atIndex:3];
     [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:4];
     [e setThreadgroupMemoryLength:m->experts * sizeof(float) atIndex:0];
     [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    for (uint32_t slot = 0; slot < m->experts_used; ++slot) {
-        encode_expert_gemv(s, e, w->gate_exps, s->norm_x, s->gate, slot);
-        encode_expert_gemv(s, e, w->up_exps, s->norm_x, s->up, slot);
-        encode_simple(e, s->swiglu, s->gate, s->up, m->expert_hidden);
-        encode_expert_gemv(s, e, w->down_exps, s->gate, s->tmp, slot);
-        [e setComputePipelineState:s->moe_add]; [e setBuffer:s->x offset:0 atIndex:0];
-        [e setBuffer:s->tmp offset:0 atIndex:1]; [e setBuffer:s->expert_weights offset:0 atIndex:2];
-        [e setBytes:&slot length:sizeof(slot) atIndex:3]; [e setBytes:&m->dim length:sizeof(m->dim) atIndex:4];
-        dispatch_1d(e, s->moe_add, m->dim);
-    }
+}
+static void encode_moe_gate_up(dsm_metal *s, id<MTLComputeCommandEncoder> e, const dsm_layer *w) {
+    const dsm_model *m = s->m;
+    encode_expert_gemv(s, e, w->gate_exps, s->norm_x, s->gate);
+    encode_expert_gemv(s, e, w->up_exps, s->norm_x, s->up);
+    [e setComputePipelineState:s->expert_swiglu]; [e setBuffer:s->gate offset:0 atIndex:0];
+    [e setBuffer:s->up offset:0 atIndex:1]; [e setBytes:&m->expert_hidden length:sizeof(m->expert_hidden) atIndex:2];
+    [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:3];
+    dispatch_1d(e, s->expert_swiglu, m->expert_hidden * m->experts_used);
+}
+static void encode_moe_down(dsm_metal *s, id<MTLComputeCommandEncoder> e, const dsm_layer *w) {
+    const dsm_model *m = s->m;
+    id<MTLBuffer> wb; uint64_t off;
+    if (!tensor_view(s, w->down_exps, &wb, &off)) return;
+    expert_gemv_params p = {(uint32_t)w->down_exps->dims[0], (uint32_t)w->down_exps->dims[1],
+                             (uint32_t)(w->down_exps->bytes / w->down_exps->dims[2]), m->dim, m->expert_hidden};
+    [e setComputePipelineState:s->expert_q4k]; [e setBuffer:wb offset:(NSUInteger)off atIndex:0];
+    [e setBuffer:s->gate offset:0 atIndex:1]; [e setBuffer:s->tmp offset:0 atIndex:2];
+    [e setBytes:&p length:sizeof(p) atIndex:3]; [e setBuffer:s->expert_ids offset:0 atIndex:4];
+    [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
+    [e dispatchThreadgroups:MTLSizeMake(p.out, 1, m->experts_used) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+static void encode_moe_accumulate(dsm_metal *s, id<MTLComputeCommandEncoder> e) {
+    const dsm_model *m = s->m;
+    [e setComputePipelineState:s->moe_add]; [e setBuffer:s->x offset:0 atIndex:0];
+    [e setBuffer:s->tmp offset:0 atIndex:1]; [e setBuffer:s->expert_weights offset:0 atIndex:2];
+    [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:3]; [e setBytes:&m->dim length:sizeof(m->dim) atIndex:4];
+    dispatch_1d(e, s->moe_add, m->dim);
+}
+static void encode_moe(dsm_metal *s, id<MTLComputeCommandEncoder> e, const dsm_layer *w) {
+    encode_moe_router(s, e, w); encode_moe_topk(s, e);
+    encode_moe_gate_up(s, e, w); encode_moe_down(s, e, w); encode_moe_accumulate(s, e);
 }
 static void encode_norm(dsm_metal *s, id<MTLComputeCommandEncoder> e, id<MTLBuffer> x, const gguf_tensor *w, id<MTLBuffer> out, uint32_t width, uint32_t groups) {
     id<MTLBuffer> wb; uint64_t off; if (!tensor_view(s,w,&wb,&off)) return; norm_params p={width,groups,s->m->rms_eps};
@@ -227,9 +257,9 @@ int dsm_metal_init(dsm_metal **out,const dsm_model *m,uint32_t context,char *err
     dsm_metal *s=calloc(1,sizeof(*s)); if(!s){set_error(error,error_size,"out of memory");return 0;} s->m=m;s->context=context;s->profile.enabled=getenv("DSM_PROFILE") && !strcmp(getenv("DSM_PROFILE"),"1");s->device=MTLCreateSystemDefaultDevice(); if(!s->device){set_error(error,error_size,"no Metal device");goto bad;}s->queue=[s->device newCommandQueue];
     NSError *ns_error=nil; NSString *source=[NSString stringWithContentsOfFile:shader_path() encoding:NSUTF8StringEncoding error:&ns_error];if(!source){set_error(error,error_size,ns_error.localizedDescription.UTF8String);goto bad;}MTLCompileOptions *options=[MTLCompileOptions new];if (@available(macOS 15.0,*)) options.mathMode=MTLMathModeSafe;
     id<MTLLibrary> lib=[s->device newLibraryWithSource:source options:options error:&ns_error];if(!lib){set_error(error,error_size,ns_error.localizedDescription.UTF8String);goto bad;}
-    s->q8=pipeline(s->device,lib,@"q8_gemv",error,error_size);s->q2k=pipeline(s->device,lib,@"q2k_gemv",error,error_size);s->q3k=pipeline(s->device,lib,@"q3k_gemv",error,error_size);s->q4k=pipeline(s->device,lib,@"q4k_gemv",error,error_size);s->q5k=pipeline(s->device,lib,@"q5k_gemv",error,error_size);s->q6k=pipeline(s->device,lib,@"q6k_gemv",error,error_size);s->f32=pipeline(s->device,lib,@"f32_gemv",error,error_size);s->norm=pipeline(s->device,lib,@"rmsnorm",error,error_size);s->rope=pipeline(s->device,lib,@"rope_neox",error,error_size);s->cache=pipeline(s->device,lib,@"cache_write",error,error_size);s->attention=pipeline(s->device,lib,@"attention_decode",error,error_size);s->add=pipeline(s->device,lib,@"add_inplace",error,error_size);s->swiglu=pipeline(s->device,lib,@"swiglu",error,error_size);s->route_topk=pipeline(s->device,lib,@"route_topk",error,error_size);s->expert_q3k=pipeline(s->device,lib,@"expert_q3k_gemv",error,error_size);s->expert_q4k=pipeline(s->device,lib,@"expert_q4k_gemv",error,error_size);s->moe_add=pipeline(s->device,lib,@"moe_add",error,error_size);if(!s->q8||!s->q2k||!s->q3k||!s->q4k||!s->q5k||!s->q6k||!s->f32||!s->norm||!s->rope||!s->cache||!s->attention||!s->add||!s->swiglu||!s->route_topk||!s->expert_q3k||!s->expert_q4k||!s->moe_add)goto bad;
+    s->q8=pipeline(s->device,lib,@"q8_gemv",error,error_size);s->q2k=pipeline(s->device,lib,@"q2k_gemv",error,error_size);s->q3k=pipeline(s->device,lib,@"q3k_gemv",error,error_size);s->q4k=pipeline(s->device,lib,@"q4k_gemv",error,error_size);s->q5k=pipeline(s->device,lib,@"q5k_gemv",error,error_size);s->q6k=pipeline(s->device,lib,@"q6k_gemv",error,error_size);s->f32=pipeline(s->device,lib,@"f32_gemv",error,error_size);s->norm=pipeline(s->device,lib,@"rmsnorm",error,error_size);s->rope=pipeline(s->device,lib,@"rope_neox",error,error_size);s->cache=pipeline(s->device,lib,@"cache_write",error,error_size);s->attention=pipeline(s->device,lib,@"attention_decode",error,error_size);s->add=pipeline(s->device,lib,@"add_inplace",error,error_size);s->swiglu=pipeline(s->device,lib,@"swiglu",error,error_size);s->route_topk=pipeline(s->device,lib,@"route_topk",error,error_size);s->expert_q3k=pipeline(s->device,lib,@"expert_q3k_gemv",error,error_size);s->expert_q4k=pipeline(s->device,lib,@"expert_q4k_gemv",error,error_size);s->expert_swiglu=pipeline(s->device,lib,@"expert_swiglu",error,error_size);s->moe_add=pipeline(s->device,lib,@"moe_add",error,error_size);if(!s->q8||!s->q2k||!s->q3k||!s->q4k||!s->q5k||!s->q6k||!s->f32||!s->norm||!s->rope||!s->cache||!s->attention||!s->add||!s->swiglu||!s->route_topk||!s->expert_q3k||!s->expert_q4k||!s->expert_swiglu||!s->moe_add)goto bad;
     const uint64_t page=(uint64_t)getpagesize(), start=m->gguf.tensor_data_offset&~(page-1), end=m->gguf.size, max=[s->device maxBufferLength]&~(page-1);if(!max){set_error(error,error_size,"Metal max buffer length is zero");goto bad;}s->n_views=(uint32_t)((end-start+max-1)/max);s->views=calloc(s->n_views,sizeof(*s->views));if(!s->views){set_error(error,error_size,"out of memory");goto bad;}for(uint32_t i=0;i<s->n_views;++i){uint64_t off=start+(uint64_t)i*max,bytes=end-off<max?end-off:max;bytes=(bytes+page-1)&~(page-1);s->views[i].buffer=[s->device newBufferWithBytesNoCopy:(void *)(m->gguf.map+off) length:(NSUInteger)bytes options:MTLResourceStorageModeShared deallocator:nil];s->views[i].file_offset=off;s->views[i].bytes=bytes;if(!s->views[i].buffer){set_error(error,error_size,"cannot wrap GGUF mmap in Metal buffer");goto bad;}}
-    uint32_t ffn=m->is_moe?m->expert_hidden:m->hidden;uint64_t kv=(uint64_t)m->layers*context*m->kv_heads*m->key_dim*4;s->x=buffer(s->device,m->dim*4);s->norm_x=buffer(s->device,m->dim*4);s->q=buffer(s->device,m->q_width*4);s->k=buffer(s->device,m->kv_heads*m->key_dim*4);s->v=buffer(s->device,m->kv_heads*m->value_dim*4);s->att=buffer(s->device,m->attn_width*4);s->tmp=buffer(s->device,m->dim*4);s->gate=buffer(s->device,ffn*4);s->up=buffer(s->device,ffn*4);s->route=m->is_moe?buffer(s->device,m->experts*4):NULL;s->expert_ids=m->is_moe?buffer(s->device,m->experts_used*4):NULL;s->expert_weights=m->is_moe?buffer(s->device,m->experts_used*4):NULL;s->scores=buffer(s->device,(uint64_t)context*m->heads*4);s->keys=buffer(s->device,kv);s->values=buffer(s->device,kv);s->logits=buffer(s->device,m->vocab*4);if(!s->x||!s->norm_x||!s->q||!s->k||!s->v||!s->att||!s->tmp||!s->gate||!s->up||(m->is_moe&&(!s->route||!s->expert_ids||!s->expert_weights))||!s->scores||!s->keys||!s->values||!s->logits){set_error(error,error_size,"cannot allocate Metal activations");goto bad;}*out=s;return 1;
+    uint32_t ffn=m->is_moe?m->expert_hidden:m->hidden, slots=m->is_moe?m->experts_used:1;uint64_t kv=(uint64_t)m->layers*context*m->kv_heads*m->key_dim*4;s->x=buffer(s->device,m->dim*4);s->norm_x=buffer(s->device,m->dim*4);s->q=buffer(s->device,m->q_width*4);s->k=buffer(s->device,m->kv_heads*m->key_dim*4);s->v=buffer(s->device,m->kv_heads*m->value_dim*4);s->att=buffer(s->device,m->attn_width*4);s->tmp=buffer(s->device,m->dim*slots*4);s->gate=buffer(s->device,ffn*slots*4);s->up=buffer(s->device,ffn*slots*4);s->route=m->is_moe?buffer(s->device,m->experts*4):NULL;s->expert_ids=m->is_moe?buffer(s->device,m->experts_used*4):NULL;s->expert_weights=m->is_moe?buffer(s->device,m->experts_used*4):NULL;s->scores=buffer(s->device,(uint64_t)context*m->heads*4);s->keys=buffer(s->device,kv);s->values=buffer(s->device,kv);s->logits=buffer(s->device,m->vocab*4);if(!s->x||!s->norm_x||!s->q||!s->k||!s->v||!s->att||!s->tmp||!s->gate||!s->up||(m->is_moe&&(!s->route||!s->expert_ids||!s->expert_weights))||!s->scores||!s->keys||!s->values||!s->logits){set_error(error,error_size,"cannot allocate Metal activations");goto bad;}*out=s;return 1;
 bad:dsm_metal_free(s);return 0;
 }
 void dsm_metal_free(dsm_metal *s){if(!s)return;if(s->profile.enabled)dsm_metal_profile_print(s);free(s->views);free(s);}
@@ -253,7 +283,11 @@ static int profile_layer(dsm_metal *s, const dsm_layer *w, uint32_t layer, uint3
     PROFILE_ENCODE(PROFILE_RESIDUAL,1,0,encode_simple(e,s->add,s->x,s->tmp,m->dim));
     PROFILE_ENCODE(PROFILE_RMSNORM,1,0,encode_norm(s,e,s->x,w->ffn_norm,s->norm_x,m->dim,1));
     if (m->is_moe) {
-        PROFILE_ENCODE(PROFILE_FFN_GATE_UP_GEMV, 1, w->gate_inp->bytes + w->gate_exps->bytes + w->up_exps->bytes, encode_moe(s, e, w));
+        PROFILE_ENCODE(PROFILE_MOE_ROUTER, 1, w->gate_inp->bytes, encode_moe_router(s, e, w));
+        PROFILE_ENCODE(PROFILE_MOE_TOPK, 1, 0, encode_moe_topk(s, e));
+        PROFILE_ENCODE(PROFILE_MOE_EXPERT_GATE_UP, 3, m->experts_used * (w->gate_exps->bytes + w->up_exps->bytes) / m->experts, encode_moe_gate_up(s, e, w));
+        PROFILE_ENCODE(PROFILE_MOE_EXPERT_DOWN, 1, m->experts_used * w->down_exps->bytes / m->experts, encode_moe_down(s, e, w));
+        PROFILE_ENCODE(PROFILE_MOE_ACCUMULATE, 1, 0, encode_moe_accumulate(s, e));
     } else {
         PROFILE_ENCODE(PROFILE_FFN_GATE_UP_GEMV,2,w->gate->bytes+w->up->bytes,encode_gemv(s,e,w->gate,s->norm_x,s->gate);encode_gemv(s,e,w->up,s->norm_x,s->up));
         PROFILE_ENCODE(PROFILE_SWIGLU,1,0,encode_simple(e,s->swiglu,s->gate,s->up,m->hidden));
