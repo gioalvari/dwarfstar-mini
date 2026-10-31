@@ -9,11 +9,14 @@ dsm: $(SRC) src/main.c metal/dsm.metal
 	$(CC) $(CFLAGS) -o $@ $(SRC) src/main.c $(LDFLAGS)
 test_gguf: src/gguf.c tests/test_gguf.c
 	$(CC) $(CFLAGS) -o $@ src/gguf.c tests/test_gguf.c
-test: test_gguf
+test_quants: src/gguf.c src/quants.c tests/test_quants.c
+	$(CC) $(CFLAGS) -o $@ src/gguf.c src/quants.c tests/test_quants.c -lm
+test: test_gguf test_quants
 	./test_gguf
+	./test_quants
 check-quants: tools/ggml_dequant_check.c src/gguf.c src/quants.c
 	$(CC) $(CFLAGS) -I../llama.cpp/ggml/include -o $@ tools/ggml_dequant_check.c src/gguf.c src/quants.c -L../llama.cpp/build/bin -lggml-base -Wl,-rpath,@loader_path/../llama.cpp/build/bin -lm
 check-metal-gemv: tools/metal_gemv_check.m $(SRC) metal/dsm.metal
 	$(CC) $(CFLAGS) -o $@ tools/metal_gemv_check.m $(SRC) $(LDFLAGS)
 clean:
-	rm -f dsm test_gguf
+	rm -f dsm test_gguf test_quants check-quants check-metal-gemv
