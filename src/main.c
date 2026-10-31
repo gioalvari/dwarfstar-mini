@@ -40,6 +40,7 @@ int main(int argc, char **argv) {
     if (tokens_only) { for (size_t i = 0; i < ids.len; ++i) printf("%s%d", i ? " " : "", ids.ids[i]); puts(""); dsm_tokens_free(&ids); dsm_tokenizer_free(tok); dsm_model_close(&model); free(rendered); return 0; }
     int use_metal = backend ? !strcmp(backend, "metal") : dsm_metal_available();
     if (backend && strcmp(backend, "cpu") && strcmp(backend, "metal")) { fprintf(stderr, "dsm: unknown backend '%s'\n", backend); return 2; }
+    if (use_metal && model.is_moe) { fprintf(stderr, "dsm: MoE not yet supported on Metal, use --backend cpu\n"); return 1; }
     dsm_forward *f = NULL; dsm_metal *metal = NULL; uint32_t context = (uint32_t)(ids.len + (size_t)n + 1); char metal_error[256];
     if (use_metal) {
         if (!dsm_metal_init(&metal, &model, context, metal_error, sizeof(metal_error))) {

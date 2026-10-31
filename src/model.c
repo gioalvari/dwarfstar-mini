@@ -15,27 +15,55 @@ static int matrix(const gguf_tensor *t, uint64_t in, uint64_t out) {
     return t && t->ndim == 2 && t->dims[0] == in && t->dims[1] == out &&
            dsm_quant_supported(t->type);
 }
+static int expert_matrix(const gguf_tensor *t, uint64_t in, uint64_t out,
+                         uint64_t experts) {
+    return t && t->ndim == 3 && t->dims[0] == in && t->dims[1] == out &&
+           t->dims[2] == experts && dsm_quant_supported(t->type);
+}
 static int vector(const gguf_tensor *t, uint64_t n) {
     return t && t->ndim == 1 && t->dims[0] == n && t->type == GGML_TYPE_F32;
+}
+static int metadata_bool(const gguf_file *g, const char *key, int expected) {
+    const gguf_kv *kv = gguf_kv_find(g, key);
+    if (!kv) return 1;
+    if (kv->type != GGUF_BOOL) return 0;
+    return g->map[kv->value_offset] == expected;
 }
 int dsm_model_open(dsm_model *m, const char *path) {
     memset(m, 0, sizeof(*m));
     if (!gguf_open(&m->gguf, path)) { snprintf(m->error, sizeof(m->error), "%s", m->gguf.error); return 0; }
     gguf_str arch;
-    if (!gguf_get_string(&m->gguf, "general.architecture", &arch) || arch.len != 5 || memcmp(arch.ptr, "qwen3", 5) ||
-        !gguf_get_u32(&m->gguf, "qwen3.block_count", &m->layers) ||
-        !gguf_get_u32(&m->gguf, "qwen3.context_length", &m->context) ||
-        !gguf_get_u32(&m->gguf, "qwen3.embedding_length", &m->dim) ||
-        !gguf_get_u32(&m->gguf, "qwen3.feed_forward_length", &m->hidden) ||
-        !gguf_get_u32(&m->gguf, "qwen3.attention.head_count", &m->heads) ||
-        !gguf_get_u32(&m->gguf, "qwen3.attention.head_count_kv", &m->kv_heads) ||
-        !gguf_get_u32(&m->gguf, "qwen3.attention.key_length", &m->key_dim) ||
-        !gguf_get_u32(&m->gguf, "qwen3.attention.value_length", &m->value_dim) ||
-        !gguf_get_f32(&m->gguf, "qwen3.rope.freq_base", &m->rope_base) ||
-        !gguf_get_f32(&m->gguf, "qwen3.attention.layer_norm_rms_epsilon", &m->rms_eps) ||
+    if (!gguf_get_string(&m->gguf, "general.architecture", &arch) ||
+        !((arch.len == 5 && !memcmp(arch.ptr, "qwen3", 5)) ||
+          (arch.len == 8 && !memcmp(arch.ptr, "qwen3moe", 8)))) {
+        fail(m, "unsupported architecture"); goto bad;
+    }
+    m->is_moe = arch.len == 8;
+    const char *prefix = m->is_moe ? "qwen3moe" : "qwen3";
+    char key[96];
+#define META_U32(name, value) (snprintf(key, sizeof(key), "%s.%s", prefix, name), gguf_get_u32(&m->gguf, key, value))
+#define META_F32(name, value) (snprintf(key, sizeof(key), "%s.%s", prefix, name), gguf_get_f32(&m->gguf, key, value))
+    if (!META_U32("block_count", &m->layers) ||
+        !META_U32("context_length", &m->context) ||
+        !META_U32("embedding_length", &m->dim) ||
+        (!m->is_moe && !META_U32("feed_forward_length", &m->hidden)) ||
+        (m->is_moe && (!META_U32("expert_count", &m->experts) ||
+                       !META_U32("expert_used_count", &m->experts_used) ||
+                       !META_U32("expert_feed_forward_length", &m->expert_hidden))) ||
+        !META_U32("attention.head_count", &m->heads) ||
+        !META_U32("attention.head_count_kv", &m->kv_heads) ||
+        !META_U32("attention.key_length", &m->key_dim) ||
+        !META_U32("attention.value_length", &m->value_dim) ||
+        !META_F32("rope.freq_base", &m->rope_base) ||
+        !META_F32("attention.layer_norm_rms_epsilon", &m->rms_eps) ||
+        (m->is_moe && (!metadata_bool(&m->gguf, "qwen3moe.expert_weights_norm", 1) ||
+                       !metadata_bool(&m->gguf, "qwen3moe.norm_top_k_prob", 1))) ||
+        (m->is_moe && (!m->experts || !m->experts_used || m->experts_used > m->experts)) ||
         !m->layers || m->heads % m->kv_heads || m->dim != m->heads * m->key_dim || m->key_dim != m->value_dim) {
         fail(m, "unsupported or invalid Qwen3 metadata"); goto bad;
     }
+#undef META_U32
+#undef META_F32
     m->token_embd = gguf_tensor_find(&m->gguf, "token_embd.weight");
     m->output_norm = gguf_tensor_find(&m->gguf, "output_norm.weight");
     m->output = gguf_tensor_find(&m->gguf, "output.weight");
@@ -51,13 +79,24 @@ int dsm_model_open(dsm_model *m, const char *path) {
         l->k = need(m, "blk.%u.attn_k.weight", i); l->v = need(m, "blk.%u.attn_v.weight", i);
         l->o = need(m, "blk.%u.attn_output.weight", i); l->q_norm = need(m, "blk.%u.attn_q_norm.weight", i);
         l->k_norm = need(m, "blk.%u.attn_k_norm.weight", i); l->ffn_norm = need(m, "blk.%u.ffn_norm.weight", i);
-        l->gate = need(m, "blk.%u.ffn_gate.weight", i); l->up = need(m, "blk.%u.ffn_up.weight", i);
-        l->down = need(m, "blk.%u.ffn_down.weight", i);
-        if (!l->attn_norm || !l->q || !l->k || !l->v || !l->o || !l->q_norm || !l->k_norm || !l->ffn_norm || !l->gate || !l->up || !l->down ||
+        if (m->is_moe) {
+            l->gate_inp = need(m, "blk.%u.ffn_gate_inp.weight", i);
+            l->gate_exps = need(m, "blk.%u.ffn_gate_exps.weight", i);
+            l->up_exps = need(m, "blk.%u.ffn_up_exps.weight", i);
+            l->down_exps = need(m, "blk.%u.ffn_down_exps.weight", i);
+        } else {
+            l->gate = need(m, "blk.%u.ffn_gate.weight", i); l->up = need(m, "blk.%u.ffn_up.weight", i);
+            l->down = need(m, "blk.%u.ffn_down.weight", i);
+        }
+        if (!l->attn_norm || !l->q || !l->k || !l->v || !l->o || !l->q_norm || !l->k_norm || !l->ffn_norm ||
             !vector(l->attn_norm, m->dim) || !matrix(l->q, m->dim, m->dim) || !matrix(l->k, m->dim, m->kv_heads * m->key_dim) ||
             !matrix(l->v, m->dim, m->kv_heads * m->value_dim) || !matrix(l->o, m->dim, m->dim) || !vector(l->q_norm, m->key_dim) ||
-            !vector(l->k_norm, m->key_dim) || !vector(l->ffn_norm, m->dim) || !matrix(l->gate, m->dim, m->hidden) ||
-            !matrix(l->up, m->dim, m->hidden) || !matrix(l->down, m->hidden, m->dim)) { fail(m, "invalid layer tensor shape or type"); goto bad; }
+            !vector(l->k_norm, m->key_dim) || !vector(l->ffn_norm, m->dim) ||
+            (!m->is_moe && (!matrix(l->gate, m->dim, m->hidden) || !matrix(l->up, m->dim, m->hidden) || !matrix(l->down, m->hidden, m->dim))) ||
+            (m->is_moe && (!matrix(l->gate_inp, m->dim, m->experts) ||
+                           !expert_matrix(l->gate_exps, m->dim, m->expert_hidden, m->experts) ||
+                           !expert_matrix(l->up_exps, m->dim, m->expert_hidden, m->experts) ||
+                           !expert_matrix(l->down_exps, m->expert_hidden, m->dim, m->experts)))) { fail(m, "invalid layer tensor shape or type"); goto bad; }
     }
     return 1;
 bad: dsm_model_close(m); return 0;
