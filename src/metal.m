@@ -167,6 +167,9 @@ static void encode_gemv(dsm_metal *s, id<MTLComputeCommandEncoder> e, const gguf
     } else if (w->type == GGML_TYPE_Q2_K) {
         [e setBytes:&mul_mv length:sizeof(mul_mv) atIndex:3];
         [e dispatchThreadgroups:MTLSizeMake((p.out + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+    } else if (w->type == GGML_TYPE_Q3_K || w->type == GGML_TYPE_Q5_K) {
+        [e setBytes:&p length:sizeof(p) atIndex:3];
+        [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0]; [e dispatchThreadgroups:MTLSizeMake(p.out, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     } else if (w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q6_K) {
         [e setBytes:&mul_mv length:sizeof(mul_mv) atIndex:3];
         [e dispatchThreadgroups:MTLSizeMake((p.out + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
@@ -195,6 +198,7 @@ bad:dsm_metal_free(s);return 0;
 }
 void dsm_metal_free(dsm_metal *s){if(!s)return;if(s->profile.enabled)dsm_metal_profile_print(s);free(s->views);free(s);}
 uint32_t dsm_metal_pos(const dsm_metal *s){return s->pos;}
+int dsm_metal_truncate(dsm_metal *s,uint32_t pos){if(!s||pos>s->pos)return 0;s->pos=pos;return 1;}
 int dsm_metal_matvec_test(dsm_metal *s,const gguf_tensor *w,const float *input,float *output){if(!s||!w||!dsm_quant_supported(w->type))return 0;id<MTLBuffer> x=buffer(s->device,w->dims[0]*sizeof(float)),y=buffer(s->device,w->dims[1]*sizeof(float));if(!x||!y)return 0;memcpy(x.contents,input,w->dims[0]*sizeof(float));id<MTLCommandBuffer> cb=[s->queue commandBuffer];id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];encode_gemv(s,e,w,x,y);[e endEncoding];[cb commit];[cb waitUntilCompleted];if(cb.status!=MTLCommandBufferStatusCompleted)return 0;memcpy(output,y.contents,w->dims[1]*sizeof(float));return 1;}
 static int profile_layer(dsm_metal *s, const dsm_layer *w, uint32_t layer, uint32_t kvw) {
     const dsm_model *m=s->m; id<MTLCommandBuffer> cb; id<MTLComputeCommandEncoder> e; double start;

@@ -13,6 +13,7 @@ int dsm_metal_init(dsm_metal **out, const dsm_model *model, uint32_t context,
 void dsm_metal_free(dsm_metal *state);
 int dsm_metal_token(dsm_metal *state, int32_t token, float *logits);
 uint32_t dsm_metal_pos(const dsm_metal *state);
+int dsm_metal_truncate(dsm_metal *state, uint32_t pos);
 int dsm_metal_matvec_test(dsm_metal *state, const gguf_tensor *weights,
                           const float *input, float *output);
 
