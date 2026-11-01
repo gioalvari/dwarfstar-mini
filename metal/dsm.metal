@@ -519,45 +519,77 @@ kernel void attention_decode(device const float *q [[buffer(0)]], device const f
     for (uint j = tid; j < p.dim; j += 256) { float value = 0; for (uint pos = 0; pos <= p.pos; ++pos) value += head_scores[pos] * inv_sum * values[((p.layer * p.context + pos) * width + kvh * p.dim + j)]; out[head * p.dim + j] = value; }
 }
 
+// Tiled online flash attention.  One threadgroup owns four query rows for one
+// KV head; its simdgroups own the GQA query heads.  This is adapted from the
+// online-softmax approach in llama.cpp's MIT-licensed flash-attention kernels.
 kernel void attention_prefill(device const float *q [[buffer(0)]], device const float *keys [[buffer(1)]],
                               device const float *values [[buffer(2)]], device float *out [[buffer(3)]],
-                              device float *scores [[buffer(4)]], constant AttentionPrefill &p [[buffer(5)]],
-                              ushort tid [[thread_index_in_threadgroup]], uint head [[threadgroup_position_in_grid]],
-                              threadgroup float *reduce [[threadgroup(0)]]) {
-    uint row = p.rows;
-    if (head >= p.heads) return;
-    uint qpos = p.pos0 + row;
-    uint kvh = head / (p.heads / p.kv_heads);
+                              constant AttentionPrefill &p [[buffer(4)]],
+                              ushort tid [[thread_index_in_threadgroup]],
+                              ushort lane [[thread_index_in_simdgroup]],
+                              ushort simdgroup [[simdgroup_index_in_threadgroup]],
+                              uint2 group [[threadgroup_position_in_grid]],
+                              threadgroup float *scratch [[threadgroup(0)]]) {
+    constexpr uint ROWS = 4;
+    constexpr uint KEYS = 16;
+    constexpr uint DIM = 128;
+    uint row0 = group.x * ROWS;
+    uint kvh = group.y;
+    uint q_per_kv = p.heads / p.kv_heads;
+    if (kvh >= p.kv_heads || p.dim != DIM || q_per_kv > 8) return;
     uint width = p.kv_heads * p.dim;
-    device const float *query = q + row * p.heads * p.dim + head * p.dim;
-    device float *head_scores = scores + head * p.context;
-    float local_max = -INFINITY;
-    for (uint pos = tid; pos <= qpos; pos += 256) {
-        device const float *key = keys + ((p.layer * p.context + pos) * width + kvh * p.dim);
-        float dot = 0;
-        for (uint z = 0; z < p.dim; ++z) dot += query[z] * key[z];
-        float score = dot * rsqrt(float(p.dim));
-        head_scores[pos] = score;
-        local_max = max(local_max, score);
+
+    threadgroup float *k_tile = scratch;
+    threadgroup float *v_tile = k_tile + KEYS * DIM;
+    threadgroup float *q_tile = v_tile + KEYS * DIM;
+    uint q_count = min(ROWS, p.rows - row0) * q_per_kv * DIM;
+    for (uint i = tid; i < q_count; i += q_per_kv * 32) {
+        uint row = i / (q_per_kv * DIM);
+        uint in_row = i % (q_per_kv * DIM);
+        uint head = kvh * q_per_kv + in_row / DIM;
+        q_tile[i] = q[(row0 + row) * p.heads * DIM + head * DIM + in_row % DIM];
     }
-    reduce[tid] = local_max;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint step = 128; step; step >>= 1) { if (tid < step) reduce[tid] = max(reduce[tid], reduce[tid + step]); threadgroup_barrier(mem_flags::mem_threadgroup); }
-    float maxv = reduce[0], local_sum = 0;
-    for (uint pos = tid; pos <= qpos; pos += 256) {
-        float value = exp(head_scores[pos] - maxv);
-        head_scores[pos] = value;
-        local_sum += value;
-    }
-    reduce[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint step = 128; step; step >>= 1) { if (tid < step) reduce[tid] += reduce[tid + step]; threadgroup_barrier(mem_flags::mem_threadgroup); }
-    float inv_sum = 1.0f / reduce[0];
-    device float *dst = out + row * p.heads * p.dim + head * p.dim;
-    for (uint j = tid; j < p.dim; j += 256) {
-        float value = 0;
-        for (uint pos = 0; pos <= qpos; ++pos) value += head_scores[pos] * inv_sum * values[((p.layer * p.context + pos) * width + kvh * p.dim + j)];
-        dst[j] = value;
+
+    for (uint row = 0; row < ROWS && row0 + row < p.rows; ++row) {
+        uint qpos = p.pos0 + row0 + row;
+        device float4 *dst = (device float4 *)(out +
+            ((row0 + row) * p.heads + kvh * q_per_kv + simdgroup) * DIM);
+        threadgroup const float4 *query = (threadgroup const float4 *)(q_tile +
+            (row * q_per_kv + simdgroup) * DIM);
+        float4 result = 0.0f;
+        float maximum = -INFINITY;
+        float sum = 0.0f;
+        for (uint base = 0; base <= qpos; base += KEYS) {
+            uint count = min(KEYS, qpos + 1 - base);
+            uint tile_floats = count * DIM;
+            for (uint i = tid; i < tile_floats; i += q_per_kv * 32) {
+                uint pos = i / DIM;
+                uint dim = i % DIM;
+                uint offset = (p.layer * p.context + base + pos) * width + kvh * DIM + dim;
+                k_tile[i] = keys[offset];
+                v_tile[i] = values[offset];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float score = -INFINITY;
+            if (lane < count) {
+                score = 0.0f;
+                threadgroup const float4 *key = (threadgroup const float4 *)(k_tile + lane * DIM);
+                for (uint i = 0; i < DIM / 4; ++i) score += dot(query[i], key[i]);
+                score *= rsqrt(128.0f);
+            }
+            float next_maximum = max(maximum, simd_max(score));
+            float old_scale = exp(maximum - next_maximum);
+            float weight = exp(score - next_maximum);
+            result *= old_scale;
+            threadgroup const float4 *value = (threadgroup const float4 *)v_tile;
+            for (uint i = 0; i < count; ++i) result += value[i * (DIM / 4) + lane] * simd_shuffle(weight, i);
+            sum = sum * old_scale + simd_sum(weight);
+            maximum = next_maximum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        dst[lane] = result / sum;
     }
 }
 

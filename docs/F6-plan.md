@@ -151,3 +151,31 @@ active only while key <= qpos. Don't port flash_attn_ext (too big). Target
 
 Never edit decode kernels' param structs; add new structs. Each step ends with
 check-prefill passing and tok/s documented for 2k and 16k prompts.
+
+
+### Step 4 result: tiled causal attention (2026-11-01)
+
+Implemented a single `attention_prefill` dispatch per transformer layer. A
+threadgroup covers four causal query rows for one KV head, with one simdgroup
+per GQA query head. It stages 16 F32 K/V vectors at a time in threadgroup
+memory and uses online softmax, so it has no shared score buffer. Query
+positions remain absolute (`pos0 + row`) and therefore work for later chunks
+and reused KV.
+
+All `check-prefill` cases passed (max absolute logit difference below
+`1.7e-5`, same argmax, and identical 32-token greedy continuation): Q8_0 and
+Q4_K_M dense 1.7B, plus Coder 30B-A3B asymmetric; `n={1,2,33,511,512,513,1500}`
+and `DSM_PREFILL_CHUNK=7, n=37`. The Q8_0 8192-token case also passed with
+`max_abs=1.6212463e-05`. CLI greedy output matches llama.cpp on Q8_0 and the
+Coder asymmetric model for the required 32-token story prompt.
+
+Prefill throughput, tokens/s (M4 Pro; DSM uses prompt runs, llama.cpp uses
+`llama-bench -p 2048,8192 -n 0`):
+
+| model | tokens | DSM | llama.cpp |
+|---|---:|---:|---:|
+| Qwen3-1.7B Q8_0 | 2,048 | 165.49 | 1778.36 |
+| Qwen3-1.7B Q8_0 | 8,192 | 112.93 | 1465.97 |
+| Qwen3-1.7B Q8_0 | 16,384 | 70.64 | — |
+| Qwen3-Coder-30B-A3B asym | 2,048 | 67.30 | 743.68 |
+| Qwen3-Coder-30B-A3B asym | 8,192 | 61.23 | 522.55 |

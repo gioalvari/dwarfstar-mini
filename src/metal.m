@@ -504,20 +504,18 @@ static void encode_layer_batch(dsm_metal *s, id<MTLComputeCommandEncoder> e,
     cache_batch_params cache = {layer, pos0, s->context, kvw, rows};
     [e setComputePipelineState:s->cache_batch]; [e setBuffer:s->bk offset:0 atIndex:0]; [e setBuffer:s->keys offset:0 atIndex:1]; [e setBytes:&cache length:sizeof(cache) atIndex:2]; dispatch_1d(e, s->cache_batch, rows * kvw);
     [e setComputePipelineState:s->cache_batch]; [e setBuffer:s->bv offset:0 atIndex:0]; [e setBuffer:s->values offset:0 atIndex:1]; [e setBytes:&cache length:sizeof(cache) atIndex:2]; dispatch_1d(e, s->cache_batch, rows * kvw);
-    for (uint32_t row = 0; row < rows; ++row) {
-        attn_prefill_params attention = {m->heads, m->kv_heads, m->key_dim, pos0,
-                                         s->context, layer, row};
-        [e setComputePipelineState:s->attention_prefill];
-        [e setBuffer:s->bq offset:0 atIndex:0];
-        [e setBuffer:s->keys offset:0 atIndex:1];
-        [e setBuffer:s->values offset:0 atIndex:2];
-        [e setBuffer:s->batt offset:0 atIndex:3];
-        [e setBuffer:s->scores offset:0 atIndex:4];
-        [e setBytes:&attention length:sizeof(attention) atIndex:5];
-        [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
-        [e dispatchThreadgroups:MTLSizeMake(m->heads, 1, 1)
- threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    }
+    attn_prefill_params attention = {m->heads, m->kv_heads, m->key_dim, pos0,
+                                     s->context, layer, rows};
+    [e setComputePipelineState:s->attention_prefill];
+    [e setBuffer:s->bq offset:0 atIndex:0];
+    [e setBuffer:s->keys offset:0 atIndex:1];
+    [e setBuffer:s->values offset:0 atIndex:2];
+    [e setBuffer:s->batt offset:0 atIndex:3];
+    [e setBytes:&attention length:sizeof(attention) atIndex:4];
+    uint32_t q_per_kv = m->heads / m->kv_heads;
+    [e setThreadgroupMemoryLength:(NSUInteger)(2 * 16 * 128 + 4 * q_per_kv * 128) * sizeof(float) atIndex:0];
+    [e dispatchThreadgroups:MTLSizeMake((rows + 3) / 4, m->kv_heads, 1)
+ threadsPerThreadgroup:MTLSizeMake(32, q_per_kv, 1)];
     encode_matmul(s, e, w->o, s->batt, s->btmp, rows);
     [e setComputePipelineState:s->add]; [e setBuffer:s->bx offset:0 atIndex:0]; [e setBuffer:s->btmp offset:0 atIndex:1]; { uint32_t n = rows * m->dim; [e setBytes:&n length:sizeof(n) atIndex:2]; dispatch_1d(e, s->add, n); }
     encode_norm_at(s, e, s->bx, 0, w->ffn_norm, s->bnorm, 0, m->dim, rows);
