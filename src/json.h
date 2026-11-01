@@ -22,5 +22,7 @@ int dsm_json_parse(const char *text, size_t len, dsm_json **out, char *error,
 void dsm_json_free(dsm_json *value);
 const dsm_json *dsm_json_object_get(const dsm_json *object, const char *key);
 char *dsm_json_string_dup(const dsm_json *value);
+/* Allocates a compact JSON representation of value. */
+char *dsm_json_dump(const dsm_json *value);
 
 #endif

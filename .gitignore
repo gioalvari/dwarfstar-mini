@@ -4,4 +4,5 @@ models/
 /dsm
 /check-metal-gemv
 /tests/bin/
+/test_server_parse
 *.metallib

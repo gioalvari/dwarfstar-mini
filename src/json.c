@@ -92,3 +92,53 @@ char *dsm_json_string_dup(const dsm_json *v) {
     } out[j]='\0'; return out;
 bad: free(out); return NULL;
 }
+
+typedef struct { char *data; size_t len, cap; } writer;
+static int write_bytes(writer *w, const char *text, size_t len) {
+    if (w->len + len + 1 > w->cap) {
+        size_t cap = w->cap ? w->cap : 64;
+        while (cap < w->len + len + 1) cap *= 2;
+        char *data = realloc(w->data, cap);
+        if (!data) return 0;
+        w->data = data; w->cap = cap;
+    }
+    memcpy(w->data + w->len, text, len); w->len += len; w->data[w->len] = '\0';
+    return 1;
+}
+static int write_string(writer *w, const char *text, size_t len) {
+    if (!write_bytes(w, "\"", 1)) return 0;
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = (unsigned char)text[i];
+        if (c == '"' || c == '\\') { if (!write_bytes(w, "\\", 1) || !write_bytes(w, text + i, 1)) return 0; }
+        else if (c == '\n') { if (!write_bytes(w, "\\n", 2)) return 0; }
+        else if (c == '\r') { if (!write_bytes(w, "\\r", 2)) return 0; }
+        else if (c == '\t') { if (!write_bytes(w, "\\t", 2)) return 0; }
+        else if (c < 0x20) { char escape[7]; snprintf(escape, sizeof(escape), "\\u%04x", c); if (!write_bytes(w, escape, 6)) return 0; }
+        else if (!write_bytes(w, text + i, 1)) return 0;
+    }
+    return write_bytes(w, "\"", 1);
+}
+static int write_value(writer *w, const dsm_json *v) {
+    char number[64];
+    if (!v) return 0;
+    if (v->type == DSM_JSON_NULL) return write_bytes(w, "null", 4);
+    if (v->type == DSM_JSON_BOOL) return write_bytes(w, v->boolean ? "true" : "false", v->boolean ? 4 : 5);
+    if (v->type == DSM_JSON_NUMBER) { int n = snprintf(number, sizeof(number), "%.17g", v->number); return n > 0 && write_bytes(w, number, (size_t)n); }
+    if (v->type == DSM_JSON_STRING) return write_string(w, v->text, v->len);
+    if (v->type == DSM_JSON_ARRAY) {
+        if (!write_bytes(w, "[", 1)) return 0;
+        for (size_t i = 0; i < v->count; ++i) if ((i && !write_bytes(w, ",", 1)) || !write_value(w, v->items[i])) return 0;
+        return write_bytes(w, "]", 1);
+    }
+    if (v->type == DSM_JSON_OBJECT) {
+        if (!write_bytes(w, "{", 1)) return 0;
+        for (size_t i = 0; i + 1 < v->count; i += 2) if ((i && !write_bytes(w, ",", 1)) || !write_string(w, v->items[i]->text, v->items[i]->len) || !write_bytes(w, ":", 1) || !write_value(w, v->items[i + 1])) return 0;
+        return write_bytes(w, "}", 1);
+    }
+    return 0;
+}
+char *dsm_json_dump(const dsm_json *value) {
+    writer w = {0};
+    if (!write_value(&w, value)) { free(w.data); return NULL; }
+    return w.data;
+}

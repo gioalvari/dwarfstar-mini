@@ -8,9 +8,12 @@ MoE uses an asymmetric 14.36 GiB GGUF (Q3_K gate/up experts, Q4_K down
 experts, Q8_0/F32 elsewhere). Dense and routed Q3_K/Q4_K GEMVs use optimized
 Metal kernels, and `check-metal-gemv MODEL [TENSOR EXPERT_ID]` validates an
 individual routed expert slice. The same asymmetric layout supports
-Qwen3-Coder-30B-A3B-Instruct. The OpenAI-compatible server caps an unspecified
-model context at 8,192 tokens to keep KV allocation practical; use `--ctx` to
-override it. The OpenAI-compatible server supports both.
+Qwen3-Coder-30B-A3B-Instruct. The OpenAI-compatible server defaults to a
+32,768-token context and clamps requested output to the remaining context
+instead of rejecting OpenCode's large output budget. At 32k, F32 KV can be
+substantial for Coder; use `--ctx` to reduce it until F16 KV support is
+available. The server supports OpenAI tool calls for Qwen Coder's GGUF chat
+template.
 See `docs/F4b.md` and `docs/ds4-notes.md`.
 
 Reference oracle: `../llama.cpp/build/bin` (Metal build).
