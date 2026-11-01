@@ -3,7 +3,7 @@ CFLAGS := -O3 -mcpu=native -std=c11 -Wall -Wextra -Wpedantic -Isrc
 LDFLAGS := -lm -lpthread -framework Metal -framework Foundation
 SRC := src/gguf.c src/quants.c src/model.c src/tokenizer.c src/forward.c src/sampler.c src/json.c src/server.c src/metal.m
 
-.PHONY: all clean test check-quants check-metal-gemv
+.PHONY: all clean test check-quants check-metal-gemv check-prefill
 all: dsm
 dsm: $(SRC) src/main.c metal/dsm.metal
 	$(CC) $(CFLAGS) -o $@ $(SRC) src/main.c $(LDFLAGS)
@@ -18,5 +18,7 @@ check-quants: tools/ggml_dequant_check.c src/gguf.c src/quants.c
 	$(CC) $(CFLAGS) -I../llama.cpp/ggml/include -o $@ tools/ggml_dequant_check.c src/gguf.c src/quants.c -L../llama.cpp/build/bin -lggml-base -Wl,-rpath,@loader_path/../llama.cpp/build/bin -lm
 check-metal-gemv: tools/metal_gemv_check.m $(SRC) metal/dsm.metal
 	$(CC) $(CFLAGS) -o $@ tools/metal_gemv_check.m $(SRC) $(LDFLAGS)
+check-prefill: tools/prefill_check.c $(SRC) metal/dsm.metal
+	$(CC) $(CFLAGS) -o $@ tools/prefill_check.c $(SRC) $(LDFLAGS)
 clean:
-	rm -f dsm test_gguf test_quants check-quants check-metal-gemv
+	rm -f dsm test_gguf test_quants check-quants check-metal-gemv check-prefill
