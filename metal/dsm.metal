@@ -14,6 +14,9 @@ struct Norm { uint width, groups; float eps; };
 struct Rope { uint heads, dim, pos; float base; };
 struct Cache { uint layer, pos, context, width; };
 struct Attention { uint heads, kv_heads, dim, pos, context, layer; };
+struct RopeBatch { uint heads, dim, pos0, rows; float base; };
+struct CacheBatch { uint layer, pos0, context, width, rows; };
+struct AttentionPrefill { uint heads, kv_heads, dim, pos0, context, layer, rows; };
 
 // Ported from llama.cpp ggml-metal/kernels/mul_mv.metal (MIT license).
 struct block_q8_0 { half d; char qs[32]; };
@@ -469,8 +472,32 @@ kernel void rope_neox(device float *x [[buffer(0)]], constant Rope &p [[buffer(1
     float a = x[base + i], b = x[base + i + p.dim / 2]; x[base + i] = a * c - b * s; x[base + i + p.dim / 2] = a * s + b * c;
 }
 
+kernel void rope_neox_batch(device float *x [[buffer(0)]], constant RopeBatch &p [[buffer(1)]], uint index [[thread_position_in_grid]]) {
+    uint per_row = p.heads * (p.dim / 2);
+    uint total = p.rows * per_row;
+    if (index >= total) return;
+    uint row = index / per_row;
+    uint within = index % per_row;
+    uint h = within / (p.dim / 2);
+    uint i = within % (p.dim / 2);
+    float theta = float(p.pos0 + row) / pow(p.base, float(i) / float(p.dim / 2));
+    float c = cos(theta), s = sin(theta);
+    uint base = row * p.heads * p.dim + h * p.dim;
+    float a = x[base + i], b = x[base + i + p.dim / 2];
+    x[base + i] = a * c - b * s;
+    x[base + i + p.dim / 2] = a * s + b * c;
+}
+
 kernel void cache_write(device const float *src [[buffer(0)]], device float *cache [[buffer(1)]], constant Cache &p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i < p.width) cache[((p.layer * p.context + p.pos) * p.width) + i] = src[i];
+}
+
+kernel void cache_write_batch(device const float *src [[buffer(0)]], device float *cache [[buffer(1)]], constant CacheBatch &p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    uint total = p.rows * p.width;
+    if (i >= total) return;
+    uint row = i / p.width;
+    uint col = i % p.width;
+    cache[((p.layer * p.context + p.pos0 + row) * p.width) + col] = src[i];
 }
 
 kernel void attention_decode(device const float *q [[buffer(0)]], device const float *keys [[buffer(1)]],
@@ -492,6 +519,48 @@ kernel void attention_decode(device const float *q [[buffer(0)]], device const f
     for (uint j = tid; j < p.dim; j += 256) { float value = 0; for (uint pos = 0; pos <= p.pos; ++pos) value += head_scores[pos] * inv_sum * values[((p.layer * p.context + pos) * width + kvh * p.dim + j)]; out[head * p.dim + j] = value; }
 }
 
+kernel void attention_prefill(device const float *q [[buffer(0)]], device const float *keys [[buffer(1)]],
+                              device const float *values [[buffer(2)]], device float *out [[buffer(3)]],
+                              device float *scores [[buffer(4)]], constant AttentionPrefill &p [[buffer(5)]],
+                              ushort tid [[thread_index_in_threadgroup]], uint head [[threadgroup_position_in_grid]],
+                              threadgroup float *reduce [[threadgroup(0)]]) {
+    uint row = p.rows;
+    if (head >= p.heads) return;
+    uint qpos = p.pos0 + row;
+    uint kvh = head / (p.heads / p.kv_heads);
+    uint width = p.kv_heads * p.dim;
+    device const float *query = q + row * p.heads * p.dim + head * p.dim;
+    device float *head_scores = scores + head * p.context;
+    float local_max = -INFINITY;
+    for (uint pos = tid; pos <= qpos; pos += 256) {
+        device const float *key = keys + ((p.layer * p.context + pos) * width + kvh * p.dim);
+        float dot = 0;
+        for (uint z = 0; z < p.dim; ++z) dot += query[z] * key[z];
+        float score = dot * rsqrt(float(p.dim));
+        head_scores[pos] = score;
+        local_max = max(local_max, score);
+    }
+    reduce[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) { if (tid < step) reduce[tid] = max(reduce[tid], reduce[tid + step]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float maxv = reduce[0], local_sum = 0;
+    for (uint pos = tid; pos <= qpos; pos += 256) {
+        float value = exp(head_scores[pos] - maxv);
+        head_scores[pos] = value;
+        local_sum += value;
+    }
+    reduce[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) { if (tid < step) reduce[tid] += reduce[tid + step]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float inv_sum = 1.0f / reduce[0];
+    device float *dst = out + row * p.heads * p.dim + head * p.dim;
+    for (uint j = tid; j < p.dim; j += 256) {
+        float value = 0;
+        for (uint pos = 0; pos <= qpos; ++pos) value += head_scores[pos] * inv_sum * values[((p.layer * p.context + pos) * width + kvh * p.dim + j)];
+        dst[j] = value;
+    }
+}
+
 kernel void add_inplace(device float *x [[buffer(0)]], device const float *y [[buffer(1)]], constant uint &n [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i < n) x[i] += y[i]; }
 kernel void swiglu(device float *gate [[buffer(0)]], device const float *up [[buffer(1)]], constant uint &n [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i < n) { float x=gate[i]; gate[i]=(x/(1.0f+exp(-x)))*up[i]; } }
 
@@ -500,7 +569,11 @@ struct ExpertGemv { uint in, out, expert_stride, out_stride, input_stride; };
 kernel void route_topk(device const float *route [[buffer(0)]], device uint *ids [[buffer(1)]],
                        device float *weights [[buffer(2)]], constant uint &experts [[buffer(3)]],
                        constant uint &used [[buffer(4)]], ushort tid [[thread_index_in_threadgroup]],
+                       uint group [[threadgroup_position_in_grid]],
                        threadgroup float *scratch [[threadgroup(0)]]) {
+    route += group * experts;
+    ids += group * used;
+    weights += group * used;
     if (tid < experts) scratch[tid] = route[tid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid != 0) return;
@@ -615,6 +688,17 @@ kernel void moe_add(device float *x [[buffer(0)]], device const float *expert [[
                     device const float *weights [[buffer(2)]], constant uint &slots [[buffer(3)]],
                     constant uint &n [[buffer(4)]], uint i [[thread_position_in_grid]]) {
     if (i < n) { float value=0; for(uint slot=0;slot<slots;++slot)value+=weights[slot]*expert[slot*n+i]; x[i]+=value; }
+}
+
+kernel void moe_add_batch(device float *x [[buffer(0)]], device const float *expert [[buffer(1)]],
+                          device const float *weights [[buffer(2)]], constant uint &slots [[buffer(3)]],
+                          constant uint &width [[buffer(4)]], constant uint &rows [[buffer(5)]],
+                          uint i [[thread_position_in_grid]]) {
+    if (i >= rows * width) return;
+    uint row = i / width, col = i % width;
+    float value = 0;
+    for (uint slot = 0; slot < slots; ++slot) value += weights[row * slots + slot] * expert[(row * slots + slot) * width + col];
+    x[i] += value;
 }
 
 kernel void expert_swiglu(device float *gate [[buffer(0)]], device const float *up [[buffer(1)]],
