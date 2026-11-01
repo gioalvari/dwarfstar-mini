@@ -69,7 +69,9 @@ int main(int argc, char **argv) {
     if (!use_metal && !dsm_forward_init(&f, &model, context, threads)) { fprintf(stderr, "dsm: cannot allocate CPU forward state\n"); return 1; }
     float *logits = malloc((size_t)model.vocab * sizeof(*logits)); if (!logits) return 1;
     double prefill_started = now();
-    for (size_t i = 0; i < ids.len; ++i) if (!(use_metal ? dsm_metal_token(metal, ids.ids[i], logits) : dsm_forward_token(f, ids.ids[i], logits))) { fprintf(stderr, "dsm: prompt inference failed\n"); return 1; }
+    if (use_metal) {
+        if (!dsm_metal_prefill(metal, ids.ids, (uint32_t)ids.len, logits)) { fprintf(stderr, "dsm: prompt inference failed\n"); return 1; }
+    } else for (size_t i = 0; i < ids.len; ++i) if (!dsm_forward_token(f, ids.ids[i], logits)) { fprintf(stderr, "dsm: prompt inference failed\n"); return 1; }
     double prefill_elapsed = now() - prefill_started;
     if (dump) { FILE *fp = fopen(dump, "wb"); if (!fp || fwrite(logits, sizeof(*logits), model.vocab, fp) != model.vocab) { fprintf(stderr, "dsm: failed to write logits\n"); return 1; } fclose(fp); }
     dsm_sampler sampler; dsm_sampler_init(&sampler, temp, 0.95f, 1); double decode_started = now(); int generated = 0;

@@ -3,6 +3,7 @@ models/
 /build/
 /dsm
 /check-metal-gemv
+/check-prefill
 /tests/bin/
 /test_server_parse
 *.metallib
