@@ -872,8 +872,9 @@ kernel void attention_decode(device const float *q [[buffer(0)]], device const f
     reduce[tid] = local_max; threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint step = 128; step; step >>= 1) { if (tid < step) reduce[tid] = max(reduce[tid], reduce[tid + step]); threadgroup_barrier(mem_flags::mem_threadgroup); }
     float maxv = reduce[0], local_sum = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup); // all threads read reduce[0] before reuse
     for (uint pos = tid; pos <= p.pos; pos += 256) { float value = exp(head_scores[pos] - maxv); head_scores[pos] = value; local_sum += value; }
-    reduce[tid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup);
+    reduce[tid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device); // head_scores read cross-thread below
     for (uint step = 128; step; step >>= 1) { if (tid < step) reduce[tid] += reduce[tid + step]; threadgroup_barrier(mem_flags::mem_threadgroup); }
     float inv_sum = 1.0f / reduce[0];
     for (uint j = tid; j < p.dim; j += 256) { float value = 0; for (uint pos = 0; pos <= p.pos; ++pos) value += head_scores[pos] * inv_sum * values[((p.layer * p.context + pos) * width + kvh * p.dim + j)]; out[head * p.dim + j] = value; }
