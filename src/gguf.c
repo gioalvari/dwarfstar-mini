@@ -66,6 +66,7 @@ int gguf_open(gguf_file *f, const char *path) {
     f->size = (uint64_t)st.st_size;
     f->map = mmap(NULL, (size_t)f->size, PROT_READ, MAP_PRIVATE, f->fd, 0);
     if (f->map == MAP_FAILED) { f->map = NULL; fail(f, "cannot mmap GGUF"); goto bad; }
+    (void)madvise((void *)f->map, (size_t)f->size, MADV_WILLNEED);
     cursor c = {f->map, f->map + f->size}; uint32_t magic;
     if (!u32(&c, &magic) || magic != 0x46554747 || !u32(&c, &f->version) ||
         !u64(&c, &f->n_tensors) || !u64(&c, &f->n_kv) || f->version != 3 ||
