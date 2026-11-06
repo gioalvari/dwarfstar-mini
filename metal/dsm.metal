@@ -1116,28 +1116,66 @@ kernel void swiglu(device float *gate [[buffer(0)]], device const float *up [[bu
 struct ExpertGemv { uint in, out, expert_stride, out_stride, input_stride; };
 
 kernel void route_topk(device const float *route [[buffer(0)]], device uint *ids [[buffer(1)]],
-                       device float *weights [[buffer(2)]], constant uint &experts [[buffer(3)]],
-                       constant uint &used [[buffer(4)]], ushort tid [[thread_index_in_threadgroup]],
-                       uint group [[threadgroup_position_in_grid]],
-                       threadgroup float *scratch [[threadgroup(0)]]) {
+                        device float *weights [[buffer(2)]], constant uint &experts [[buffer(3)]],
+                        constant uint &used [[buffer(4)]], ushort tid [[thread_index_in_threadgroup]],
+                        uint group [[threadgroup_position_in_grid]],
+                        threadgroup float *scratch [[threadgroup(0)]]) {
     route += group * experts;
     ids += group * used;
     weights += group * used;
     if (tid < experts) scratch[tid] = route[tid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid != 0) return;
-    float maxv = -INFINITY;
-    for (uint e = 0; e < experts; ++e) maxv = max(maxv, scratch[e]);
-    float total = 0.0f;
-    for (uint e = 0; e < experts; ++e) { scratch[e] = exp(scratch[e] - maxv); total += scratch[e]; }
-    for (uint e = 0; e < experts; ++e) scratch[e] /= total;
-    float selected_total = 0.0f;
-    for (uint slot = 0; slot < used; ++slot) {
-        uint best = 0;
-        for (uint e = 1; e < experts; ++e) if (scratch[e] > scratch[best]) best = e;
-        ids[slot] = best; weights[slot] = scratch[best]; selected_total += scratch[best]; scratch[best] = -1.0f;
+    threadgroup float maxes[8];
+    threadgroup float total;
+    threadgroup float selected_total;
+    threadgroup float slot_max;
+    threadgroup uint slot_index;
+    const uint simdgroups = (experts + 31) / 32;
+    float local_max = tid < experts ? scratch[tid] : -INFINITY;
+    float simd_maximum = simd_max(local_max);
+    if ((tid & 31) == 0) maxes[tid / 32] = simd_maximum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float maximum = -INFINITY;
+        for (uint sg = 0; sg < simdgroups; ++sg) maximum = max(maximum, maxes[sg]);
+        total = maximum;
     }
-    for (uint slot = 0; slot < used; ++slot) weights[slot] /= selected_total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < experts) scratch[tid] = exp(scratch[tid] - total);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float denominator = 0.f;
+        for (uint e = 0; e < experts; ++e) denominator += scratch[e];
+        total = denominator;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < experts) scratch[tid] /= total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) selected_total = 0.f;
+    for (uint slot = 0; slot < used; ++slot) {
+        float candidate = tid < experts ? scratch[tid] : -INFINITY;
+        float maximum = simd_max(candidate);
+        uint index = candidate == maximum ? tid : UINT_MAX;
+        uint local_index = simd_min(index);
+        if ((tid & 31) == 0) { maxes[tid / 32] = maximum; scratch[experts + tid / 32] = as_type<float>(local_index); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float best = maxes[0]; uint best_index = as_type<uint>(scratch[experts]);
+            for (uint sg = 1; sg < simdgroups; ++sg) {
+                float value = maxes[sg]; uint value_index = as_type<uint>(scratch[experts + sg]);
+                if (value > best || (value == best && value_index < best_index)) {
+                    best = value; best_index = value_index;
+                }
+            }
+            slot_max = best; slot_index = best_index;
+            ids[slot] = best_index; weights[slot] = best;
+            selected_total += best;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == slot_index) scratch[tid] = -1.f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) for (uint slot = 0; slot < used; ++slot) weights[slot] /= selected_total;
 }
 
 #define EXPERT_K_GEMV(NAME, TYPE, BYTES) \

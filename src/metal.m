@@ -319,7 +319,7 @@ static void encode_moe_topk(dsm_metal *s, id<MTLComputeCommandEncoder> e) {
     [e setBuffer:s->expert_ids offset:0 atIndex:1]; [e setBuffer:s->expert_weights offset:0 atIndex:2];
     [e setBytes:&m->experts length:sizeof(m->experts) atIndex:3];
     [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:4];
-    [e setThreadgroupMemoryLength:m->experts * sizeof(float) atIndex:0];
+    [e setThreadgroupMemoryLength:(m->experts + 8) * sizeof(float) atIndex:0];
     [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
 static void encode_moe_topk_batch(dsm_metal *s, id<MTLComputeCommandEncoder> e,
@@ -331,7 +331,7 @@ static void encode_moe_topk_batch(dsm_metal *s, id<MTLComputeCommandEncoder> e,
     [e setBuffer:s->bw offset:0 atIndex:2];
     [e setBytes:&m->experts length:sizeof(m->experts) atIndex:3];
     [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:4];
-    [e setThreadgroupMemoryLength:m->experts * sizeof(float) atIndex:0];
+    [e setThreadgroupMemoryLength:(m->experts + 8) * sizeof(float) atIndex:0];
     [e dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
