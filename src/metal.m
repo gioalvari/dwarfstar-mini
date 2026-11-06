@@ -4,6 +4,7 @@
 #include "metal.h"
 #include "quants.h"
 
+#include <assert.h>
 #include <libgen.h>
 #include <mach-o/dyld.h>
 #include <stdio.h>
@@ -12,6 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 
+typedef struct { int32_t ne00, ne02; uint64_t nb01, nb02, nb03; int32_t ne12; uint64_t nb10, nb11, nb12, nb13; int32_t ne0, ne1; int16_t r2, r3; } mul_mm_params;
 typedef struct { uint32_t in, out; } gemv_params;
 typedef struct {
     int32_t ne00, ne01, ne02;
@@ -62,6 +64,7 @@ struct dsm_metal {
     id<MTLDevice> device; id<MTLCommandQueue> queue;
     id<MTLComputePipelineState> q8, q2k, q3k, q4k, q5k, q6k, f32, norm, rope, cache, attention, add, swiglu, route_topk, expert_q3k, expert_q4k, expert_swiglu, moe_add;
     id<MTLComputePipelineState> rope_batch, cache_batch, attention_prefill, moe_add_batch;
+    id<MTLComputePipelineState> mm_q8, mm_q2k, mm_q3k, mm_q4k, mm_q6k;
     weight_view *views;
     id<MTLBuffer> x, norm_x, q, k, v, att, tmp, gate, up, route, expert_ids, expert_weights, scores, keys, values, logits;
     id<MTLBuffer> bx, bnorm, bq, bk, bv, batt, btmp, bgate, bup, broute, bids, bw;
@@ -166,6 +169,11 @@ static void dispatch_1d(id<MTLComputeCommandEncoder> e, id<MTLComputePipelineSta
     [e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
 }
 static void encode_simple(id<MTLComputeCommandEncoder> e,id<MTLComputePipelineState> p,id<MTLBuffer> a,id<MTLBuffer> b,uint32_t n);
+static id<MTLComputePipelineState> matmul_pipeline(const dsm_metal *s,
+                                                   enum ggml_type type);
+static void encode_matmul(dsm_metal *s, id<MTLComputeCommandEncoder> e,
+                          const gguf_tensor *w, id<MTLBuffer> x,
+                          id<MTLBuffer> y, uint32_t rows);
 static void encode_gemv_at(dsm_metal *s, id<MTLComputeCommandEncoder> e,
                            const gguf_tensor *w, id<MTLBuffer> x,
                            NSUInteger x_off, id<MTLBuffer> y,
@@ -339,7 +347,7 @@ int dsm_metal_init(dsm_metal **out,const dsm_model *m,uint32_t context,char *err
     source=[NSString stringWithContentsOfFile:shader_path() encoding:NSUTF8StringEncoding error:&ns_error];if(!source){set_error(error,error_size,ns_error.localizedDescription.UTF8String);goto bad;}options=[MTLCompileOptions new];if (@available(macOS 15.0,*)) options.mathMode=MTLMathModeSafe;
     lib=[s->device newLibraryWithSource:source options:options error:&ns_error];if(!lib){set_error(error,error_size,ns_error.localizedDescription.UTF8String);goto bad;}
     s->q8=pipeline(s->device,lib,@"q8_gemv",error,error_size);s->q2k=pipeline(s->device,lib,@"q2k_gemv",error,error_size);s->q3k=pipeline(s->device,lib,@"q3k_gemv",error,error_size);s->q4k=pipeline(s->device,lib,@"q4k_gemv",error,error_size);s->q5k=pipeline(s->device,lib,@"q5k_gemv",error,error_size);s->q6k=pipeline(s->device,lib,@"q6k_gemv",error,error_size);s->f32=pipeline(s->device,lib,@"f32_gemv",error,error_size);s->norm=pipeline(s->device,lib,@"rmsnorm",error,error_size);s->rope=pipeline(s->device,lib,@"rope_neox",error,error_size);s->cache=pipeline(s->device,lib,@"cache_write",error,error_size);s->attention=pipeline(s->device,lib,@"attention_decode",error,error_size);s->add=pipeline(s->device,lib,@"add_inplace",error,error_size);s->swiglu=pipeline(s->device,lib,@"swiglu",error,error_size);s->route_topk=pipeline(s->device,lib,@"route_topk",error,error_size);s->expert_q3k=pipeline(s->device,lib,@"expert_q3k_gemv",error,error_size);s->expert_q4k=pipeline(s->device,lib,@"expert_q4k_gemv",error,error_size);s->expert_swiglu=pipeline(s->device,lib,@"expert_swiglu",error,error_size);s->moe_add=pipeline(s->device,lib,@"moe_add",error,error_size);if(!s->q8||!s->q2k||!s->q3k||!s->q4k||!s->q5k||!s->q6k||!s->f32||!s->norm||!s->rope||!s->cache||!s->attention||!s->add||!s->swiglu||!s->route_topk||!s->expert_q3k||!s->expert_q4k||!s->expert_swiglu||!s->moe_add)goto bad;
-    s->rope_batch=pipeline(s->device,lib,@"rope_neox_batch",error,error_size);s->cache_batch=pipeline(s->device,lib,@"cache_write_batch",error,error_size);s->attention_prefill=pipeline(s->device,lib,@"attention_prefill",error,error_size);s->moe_add_batch=pipeline(s->device,lib,@"moe_add_batch",error,error_size);if(!s->rope_batch||!s->cache_batch||!s->attention_prefill||!s->moe_add_batch)goto bad;
+    s->rope_batch=pipeline(s->device,lib,@"rope_neox_batch",error,error_size);s->cache_batch=pipeline(s->device,lib,@"cache_write_batch",error,error_size);s->attention_prefill=pipeline(s->device,lib,@"attention_prefill",error,error_size);s->moe_add_batch=pipeline(s->device,lib,@"moe_add_batch",error,error_size);s->mm_q8=pipeline(s->device,lib,@"mul_mm_q8_0",error,error_size);s->mm_q2k=pipeline(s->device,lib,@"mul_mm_q2_K",error,error_size);s->mm_q3k=pipeline(s->device,lib,@"mul_mm_q3_K",error,error_size);s->mm_q4k=pipeline(s->device,lib,@"mul_mm_q4_K",error,error_size);s->mm_q6k=pipeline(s->device,lib,@"mul_mm_q6_K",error,error_size);if(!s->rope_batch||!s->cache_batch||!s->attention_prefill||!s->moe_add_batch||!s->mm_q8||!s->mm_q2k||!s->mm_q3k||!s->mm_q4k||!s->mm_q6k)goto bad;
     const uint64_t page=(uint64_t)getpagesize(), start=m->gguf.tensor_data_offset&~(page-1), end=m->gguf.size, max=[s->device maxBufferLength]&~(page-1);if(!max){set_error(error,error_size,"Metal max buffer length is zero");goto bad;}s->n_views=(uint32_t)((end-start+max-1)/max);s->views=calloc(s->n_views,sizeof(*s->views));if(!s->views){set_error(error,error_size,"out of memory");goto bad;}for(uint32_t i=0;i<s->n_views;++i){uint64_t off=start+(uint64_t)i*max,bytes=end-off<max?end-off:max;bytes=(bytes+page-1)&~(page-1);s->views[i].buffer=[s->device newBufferWithBytesNoCopy:(void *)(m->gguf.map+off) length:(NSUInteger)bytes options:MTLResourceStorageModeShared deallocator:nil];s->views[i].file_offset=off;s->views[i].bytes=bytes;if(!s->views[i].buffer){set_error(error,error_size,"cannot wrap GGUF mmap in Metal buffer");goto bad;}}
     uint32_t ffn=m->is_moe?m->expert_hidden:m->hidden, slots=m->is_moe?m->experts_used:1;uint64_t kv=(uint64_t)m->layers*context*m->kv_heads*m->key_dim*4;s->x=buffer(s->device,m->dim*4);s->norm_x=buffer(s->device,m->dim*4);s->q=buffer(s->device,m->q_width*4);s->k=buffer(s->device,m->kv_heads*m->key_dim*4);s->v=buffer(s->device,m->kv_heads*m->value_dim*4);s->att=buffer(s->device,m->attn_width*4);s->tmp=buffer(s->device,m->dim*slots*4);s->gate=buffer(s->device,ffn*slots*4);s->up=buffer(s->device,ffn*slots*4);s->route=m->is_moe?buffer(s->device,m->experts*4):NULL;s->expert_ids=m->is_moe?buffer(s->device,m->experts_used*4):NULL;s->expert_weights=m->is_moe?buffer(s->device,m->experts_used*4):NULL;s->scores=buffer(s->device,(uint64_t)context*m->heads*4);s->keys=buffer(s->device,kv);s->values=buffer(s->device,kv);s->logits=buffer(s->device,m->vocab*4);s->batch_chunk=prefill_chunk_size(m);s->bx=buffer(s->device,(uint64_t)s->batch_chunk*m->dim*4);s->bnorm=buffer(s->device,(uint64_t)s->batch_chunk*m->dim*4);s->bq=buffer(s->device,(uint64_t)s->batch_chunk*m->q_width*4);s->bk=buffer(s->device,(uint64_t)s->batch_chunk*m->kv_heads*m->key_dim*4);s->bv=buffer(s->device,(uint64_t)s->batch_chunk*m->kv_heads*m->value_dim*4);s->batt=buffer(s->device,(uint64_t)s->batch_chunk*m->attn_width*4);s->btmp=buffer(s->device,(uint64_t)s->batch_chunk*m->dim*slots*4);s->bgate=buffer(s->device,(uint64_t)s->batch_chunk*ffn*slots*4);s->bup=buffer(s->device,(uint64_t)s->batch_chunk*ffn*slots*4);s->broute=m->is_moe?buffer(s->device,(uint64_t)s->batch_chunk*m->experts*4):NULL;s->bids=m->is_moe?buffer(s->device,(uint64_t)s->batch_chunk*m->experts_used*4):NULL;s->bw=m->is_moe?buffer(s->device,(uint64_t)s->batch_chunk*m->experts_used*4):NULL;if(!s->x||!s->norm_x||!s->q||!s->k||!s->v||!s->att||!s->tmp||!s->gate||!s->up||(m->is_moe&&(!s->route||!s->expert_ids||!s->expert_weights))||!s->scores||!s->keys||!s->values||!s->logits||!s->bx||!s->bnorm||!s->bq||!s->bk||!s->bv||!s->batt||!s->btmp||!s->bgate||!s->bup||(m->is_moe&&(!s->broute||!s->bids||!s->bw))){set_error(error,error_size,"cannot allocate Metal activations");goto bad;}*out=s;return 1;
 bad:dsm_metal_free(s);return 0;
@@ -348,6 +356,22 @@ void dsm_metal_free(dsm_metal *s){if(!s)return;if(s->profile.enabled)dsm_metal_p
 uint32_t dsm_metal_pos(const dsm_metal *s){return s->pos;}
 int dsm_metal_truncate(dsm_metal *s,uint32_t pos){if(!s||pos>s->pos)return 0;s->pos=pos;return 1;}
 int dsm_metal_matvec_test(dsm_metal *s,const gguf_tensor *w,const float *input,float *output){if(!s||!w||!dsm_quant_supported(w->type))return 0;id<MTLBuffer> x=buffer(s->device,w->dims[0]*sizeof(float)),y=buffer(s->device,w->dims[1]*sizeof(float));if(!x||!y)return 0;memcpy(x.contents,input,w->dims[0]*sizeof(float));id<MTLCommandBuffer> cb=[s->queue commandBuffer];id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];encode_gemv(s,e,w,x,y);[e endEncoding];[cb commit];[cb waitUntilCompleted];if(cb.status!=MTLCommandBufferStatusCompleted)return 0;memcpy(output,y.contents,w->dims[1]*sizeof(float));return 1;}
+int dsm_metal_matmul_test(dsm_metal *s, const gguf_tensor *w, const float *input,
+                          uint32_t rows, float *output) {
+    if (!s || !w || !input || !output || !rows || w->ndim != 2 ||
+        !matmul_pipeline(s, w->type) || w->dims[0] % 32) return 0;
+    id<MTLBuffer> x = buffer(s->device, (uint64_t)rows * w->dims[0] * sizeof(float));
+    id<MTLBuffer> y = buffer(s->device, (uint64_t)rows * w->dims[1] * sizeof(float));
+    if (!x || !y) return 0;
+    memcpy(x.contents, input, (uint64_t)rows * w->dims[0] * sizeof(float));
+    id<MTLCommandBuffer> cb = [s->queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    encode_matmul(s, e, w, x, y, rows);
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if (cb.status != MTLCommandBufferStatusCompleted) return 0;
+    memcpy(output, y.contents, (uint64_t)rows * w->dims[1] * sizeof(float));
+    return 1;
+}
 int dsm_metal_expert_matvec_test(dsm_metal *s,const gguf_tensor *w,uint32_t expert,const float *input,float *output){
     if(!s||!w||(w->type!=GGML_TYPE_Q3_K&&w->type!=GGML_TYPE_Q4_K)||w->ndim!=3||expert>=w->dims[2])return 0;
     id<MTLBuffer> wb,x,y,ids;uint64_t off;if(!tensor_view(s,w,&wb,&off))return 0;
@@ -457,27 +481,39 @@ static void encode_layer(dsm_metal *s, id<MTLComputeCommandEncoder> e,
         encode_simple(e, s->add, s->x, s->tmp, m->dim);
     }
 }
+static id<MTLComputePipelineState> matmul_pipeline(const dsm_metal *s, enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q8_0: return s->mm_q8;
+        default: return nil;
+    }
+}
 static void encode_matmul(dsm_metal *s, id<MTLComputeCommandEncoder> e,
                           const gguf_tensor *w, id<MTLBuffer> x,
                           id<MTLBuffer> y, uint32_t rows) {
-    if (w->type == GGML_TYPE_Q8_0) {
+    id<MTLComputePipelineState> p = rows > 8 && w->dims[0] % 32 == 0
+                                        ? matmul_pipeline(s, w->type) : nil;
+    if (p) {
+        assert(w->dims[0] % 32 == 0);
         id<MTLBuffer> wb;
         uint64_t off;
         if (!tensor_view(s, w, &wb, &off)) return;
-        gemv_mul_mv_params p = {
-            .ne00 = (int32_t)w->dims[0], .ne01 = (int32_t)w->dims[1], .ne02 = 1,
-            .nb00 = 0, .nb01 = w->bytes / w->dims[1], .nb02 = 0, .nb03 = 0,
-            .ne10 = (int32_t)w->dims[0], .ne11 = (int32_t)rows, .ne12 = 1,
-            .nb10 = sizeof(float), .nb11 = w->dims[0] * sizeof(float), .nb12 = 0, .nb13 = 0,
-            .ne0 = (int32_t)w->dims[1], .ne1 = 1, .nr0 = 0, .r2 = 1, .r3 = 1,
+        mul_mm_params args = {
+            .ne00 = (int32_t)w->dims[0], .ne02 = 1,
+            .nb01 = w->bytes / w->dims[1], .nb02 = 0, .nb03 = 0,
+            .ne12 = 1,
+            .nb10 = sizeof(float), .nb11 = w->dims[0] * sizeof(float),
+            .nb12 = 0, .nb13 = 0,
+            .ne0 = (int32_t)w->dims[1], .ne1 = (int32_t)rows,
+            .r2 = 1, .r3 = 1,
         };
-        [e setComputePipelineState:s->q8];
-        [e setBuffer:wb offset:(NSUInteger)off atIndex:0];
-        [e setBuffer:x offset:0 atIndex:1];
-        [e setBuffer:y offset:0 atIndex:2];
-        [e setBytes:&p length:sizeof(p) atIndex:3];
-        [e setThreadgroupMemoryLength:32 * sizeof(float) * 2 atIndex:0];
-        [e dispatchThreadgroups:MTLSizeMake(((uint32_t)w->dims[1] + 1) / 2, rows, 1)
+        [e setComputePipelineState:p];
+        [e setBytes:&args length:sizeof(args) atIndex:0];
+        [e setBuffer:wb offset:(NSUInteger)off atIndex:1];
+        [e setBuffer:x offset:0 atIndex:2];
+        [e setBuffer:y offset:0 atIndex:3];
+        [e setThreadgroupMemoryLength:8192 atIndex:0];
+        [e dispatchThreadgroups:MTLSizeMake((rows + 31) / 32,
+                                             ((uint32_t)w->dims[1] + 63) / 64, 1)
  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
         return;
     }
