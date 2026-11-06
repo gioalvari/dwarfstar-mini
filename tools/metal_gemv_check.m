@@ -9,7 +9,7 @@
 
 static float random_value(uint32_t *state) { *state = *state * 1664525u + 1013904223u; return ((float)(*state >> 8) / 8388608.0f) - 1.0f; }
 static int matmul_supported(uint32_t type) {
-    return type == GGML_TYPE_Q8_0;
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q6_K;
 }
 static void check(dsm_metal *metal, const gguf_tensor *weights) {
     uint64_t in = weights->dims[0], out = weights->dims[1]; float *x = malloc(in * sizeof(*x)), *cpu = malloc(out * sizeof(*cpu)), *gpu = malloc(out * sizeof(*gpu)); uint32_t state = 1;

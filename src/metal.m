@@ -484,6 +484,7 @@ static void encode_layer(dsm_metal *s, id<MTLComputeCommandEncoder> e,
 static id<MTLComputePipelineState> matmul_pipeline(const dsm_metal *s, enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q8_0: return s->mm_q8;
+        case GGML_TYPE_Q6_K: return s->mm_q6k;
         default: return nil;
     }
 }
