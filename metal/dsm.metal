@@ -1167,6 +1167,56 @@ kernel void expert_q8_0_gemv(
     }
     if (!tid && row < p.out) y[slot * p.out_stride + row] = sum[0];
 }
+kernel void expert_q8_0_gemv_fast(
+        device const block_q8_0 *w [[buffer(0)]], device const float *x [[buffer(1)]],
+        device float *y [[buffer(2)]], constant ExpertGemv &p [[buffer(3)]],
+        device const uint *ids [[buffer(4)]], threadgroup char *shmem [[threadgroup(0)]],
+        uint3 group [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]],
+        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = 2;
+    constexpr short NSG = 4;
+    constexpr short NQ = 8;
+    const uint slot = group.z;
+    const uint first_row = group.x * NR0;
+    const uint blocks = p.in / 32;
+    const uint ix = lane / (32 / NQ);
+    const uint il = lane % (32 / NQ);
+    const uint block0 = simdgroup * NQ + ix;
+    const uint64_t row_bytes = (uint64_t)blocks * sizeof(block_q8_0);
+    device const block_q8_0 *weights[NR0];
+    for (short row = 0; row < NR0; ++row) weights[row] = (device const block_q8_0 *)
+        ((device const char *)w + (uint64_t)ids[slot] * p.expert_stride +
+         (uint64_t)(first_row + row) * row_bytes);
+    device const float *input = x + slot * p.input_stride;
+    device const float *input_block = input + block0 * 32 + il * NQ;
+    float sums[NR0] = {0.f};
+    for (uint block = block0; block < blocks; block += NSG * NQ) {
+        float values[NQ];
+        for (short i = 0; i < NQ; ++i) values[i] = input_block[i];
+        for (short row = 0; row < NR0; ++row) {
+            if (first_row + row >= p.out) continue;
+            device const char *qs = weights[row][block].qs + il * NQ;
+            float dot = 0.f;
+            for (short i = 0; i < NQ; ++i) dot += float(qs[i]) * values[i];
+            sums[row] += dot * float(weights[row][block].d);
+        }
+        input_block += NSG * NQ * 32;
+    }
+    threadgroup float *reduce = (threadgroup float *)shmem;
+    for (short row = 0; row < NR0; ++row) {
+        if (simdgroup == 0) reduce[row * 32 + lane] = 0.f;
+        sums[row] = simd_sum(sums[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short row = 0; row < NR0; ++row) if (lane == 0) reduce[row * 32 + simdgroup] = sums[row];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short row = 0; row < NR0; ++row) {
+        float total = simd_sum(reduce[row * 32 + lane]);
+        if (lane == 0 && simdgroup == 0 && first_row + row < p.out) {
+            y[slot * p.out_stride + first_row + row] = total;
+        }
+    }
+}
 kernel void expert_q4k_gemv(
         device const char *w [[buffer(0)]], device const float *input [[buffer(1)]],
         device float *output [[buffer(2)]], constant ExpertGemv &p [[buffer(3)]],
