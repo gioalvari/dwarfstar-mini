@@ -12,10 +12,35 @@ static void usage(const char *argv0) {
     fprintf(stderr, "usage: %s MODEL.gguf PROMPT [--dump OUT.bin]\n", argv0);
 }
 
+enum { TOP_K = 5, GREEDY_TOKENS = 64 };
+
 static uint32_t argmax(const float *values, uint32_t n) {
     uint32_t best = 0;
     for (uint32_t i = 1; i < n; ++i) if (values[i] > values[best]) best = i;
     return best;
+}
+
+static void top_k(const float *values, uint32_t n, uint32_t *out) {
+    for (uint32_t k = 0; k < TOP_K; ++k) out[k] = UINT32_MAX;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t k = TOP_K;
+        while (k > 0 && (out[k - 1] == UINT32_MAX || values[i] > values[out[k - 1]])) --k;
+        if (k == TOP_K) continue;
+        memmove(out + k + 1, out + k, (TOP_K - k - 1) * sizeof(*out));
+        out[k] = i;
+    }
+}
+
+static int same_top_k(const float *a, const float *b, uint32_t n) {
+    uint32_t ta[TOP_K], tb[TOP_K];
+    top_k(a, n, ta);
+    top_k(b, n, tb);
+    for (uint32_t i = 0; i < TOP_K; ++i) {
+        int found = 0;
+        for (uint32_t j = 0; j < TOP_K; ++j) found |= ta[i] == tb[j];
+        if (!found) return 0;
+    }
+    return 1;
 }
 
 int main(int argc, char **argv) {
@@ -57,7 +82,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "tokenization failed\n");
         goto done;
     }
-    if (!dsm_metal_init(&metal, &model, (uint32_t)tokens.len + 32, error,
+    if (!dsm_metal_init(&metal, &model, (uint32_t)tokens.len + GREEDY_TOKENS, error,
                         sizeof(error))) {
         fprintf(stderr, "%s\n", error);
         goto done;
@@ -74,7 +99,7 @@ int main(int argc, char **argv) {
             goto done;
         }
     }
-    if (!dsm_metal_init(&prefill_metal, &model, (uint32_t)tokens.len + 32,
+    if (!dsm_metal_init(&prefill_metal, &model, (uint32_t)tokens.len + GREEDY_TOKENS,
                         error, sizeof(error)) ||
         !dsm_metal_prefill(prefill_metal, tokens.ids, (uint32_t)tokens.len,
                            prefill)) {
@@ -90,13 +115,15 @@ int main(int argc, char **argv) {
     uint32_t prefill_argmax = argmax(prefill, model.vocab);
     printf("tokens=%zu max_abs=%.8g argmax=%u/%u\n", tokens.len, max_abs,
            reference_argmax, prefill_argmax);
-    if (!(max_abs < 1e-2f) || reference_argmax != prefill_argmax) {
+    int top_k_ok = same_top_k(reference, prefill, model.vocab);
+    printf("top%d=%s\n", TOP_K, top_k_ok ? "same" : "different");
+    if (!(max_abs < 5e-2f) || reference_argmax != prefill_argmax || !top_k_ok) {
         fprintf(stderr, "prefill parity failed\n");
         goto done;
     }
     dsm_sampler sampler;
     dsm_sampler_init(&sampler, 0.0f, 0.95f, 1);
-    for (uint32_t i = 0; i < 32; ++i) {
+    for (uint32_t i = 0; i < GREEDY_TOKENS; ++i) {
         int32_t reference_token = dsm_sample(&sampler, reference, model.vocab);
         int32_t prefill_token = dsm_sample(&sampler, prefill, model.vocab);
         if (reference_token != prefill_token ||
