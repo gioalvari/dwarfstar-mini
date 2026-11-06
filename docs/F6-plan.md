@@ -179,3 +179,37 @@ Prefill throughput, tokens/s (M4 Pro; DSM uses prompt runs, llama.cpp uses
 | Qwen3-1.7B Q8_0 | 16,384 | 70.64 | — |
 | Qwen3-Coder-30B-A3B asym | 2,048 | 67.30 | 743.68 |
 | Qwen3-Coder-30B-A3B asym | 8,192 | 61.23 | 522.55 |
+
+### Steps 2-3 results (2026-11-06)
+
+Measurements use the 570-token F6 prompt, Metal backend, and best of three
+runs on M4 Pro. `old prefill` disables batch prefill with `DSM_PREFILL=0`.
+`cold` is the first process-local prefill; `warm` is the best of three fresh
+Metal states in one process. Decode is a 128-token greedy run. A dash means no
+llama-bench baseline was collected for that quantization.
+
+| model | old prefill | DSM prefill cold | DSM prefill warm | DSM decode tok/s | llama.cpp pp512 | llama.cpp tg128 | parity (kl/max_abs) |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 1.7B Q2_K | 102.20 | 911.07 | 895.57 | 81.69 | - | - | `2.16e-08` / `0.03252` |
+| 1.7B Q4_K_M | 110.80 | 1022.82 | 889.01 | 80.00 | 1882 | 143.0 | `1.17e-09` / `0.01083` |
+| 1.7B Q8_0 | 83.37 | 1059.91 | 941.95 | 65.95 | 1978 | 99.3 | `4.44e-10` / `0.009786` |
+| 30B-A3B asym | 40.77 | 395.01 | 393.58 | 31.69 | 849 | 66.8 | `2.29e-06` / `0.9122` |
+| Coder-30B-A3B asym | 39.44 | 404.01 | 386.79 | 31.55 | - | - | `1.38e-05` / `0.6318` |
+| Coder-30B-A3B Q8_0 | 26.62 | 404.89 | 345.28 | 23.58 | 814 | 50.8 | `3.51e-06` / `0.3024` |
+
+For 30B-A3B asym, `DSM_MUL_MM_ID=0` measured 134.27 tok/s prefill, versus
+395.01 tok/s with indirect expert matmul. All rows pass the current parity
+check: dense models use maximum absolute logit difference below `5e-2`; MoE
+models use KL below `1e-4` and maximum probability difference below `1e-3`,
+plus matching argmax, top-5, and 64-token greedy continuation. The larger MoE
+absolute-logit values are benign expert-routing near-ties.
+
+Bugs fixed during the rollout: the `attention_decode` softmax race (`ad94b14`),
+batched expert SwiGLU rows (`8d52b89`), and a Metal weight-view boundary
+straddle for Coder Q8_0 (`73c4be3`). Weight residency now requests `madvise`
+and macOS 15 Metal residency for mapped weight views.
+
+The remaining throughput gap versus llama.cpp is prioritized as: fuse expert
+gate+up and share map0 / fuse SwiGLU epilogue; retile `attention_prefill` with
+simdgroup matrices; port decode `mul_mv_id` Q8_0 and parallelize `route_topk`;
+then fuse Q/K/V projections.

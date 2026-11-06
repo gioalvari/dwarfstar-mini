@@ -3,7 +3,7 @@ CFLAGS := -O3 -mcpu=native -std=c11 -Wall -Wextra -Wpedantic -Isrc
 LDFLAGS := -lm -lpthread -framework Metal -framework Foundation
 SRC := src/gguf.c src/quants.c src/model.c src/tokenizer.c src/forward.c src/sampler.c src/json.c src/server.c src/metal.m
 
-.PHONY: all clean test check-quants check-metal-gemv check-prefill
+.PHONY: all clean test check-quants check-metal-gemv check-prefill bench-prefill
 all: dsm
 dsm: $(SRC) src/main.c metal/dsm.metal
 	$(CC) $(CFLAGS) -o $@ $(SRC) src/main.c $(LDFLAGS)
@@ -23,5 +23,7 @@ check-metal-gemv: tools/metal_gemv_check.m $(SRC) metal/dsm.metal
 	$(CC) $(CFLAGS) -o $@ tools/metal_gemv_check.m $(SRC) $(LDFLAGS)
 check-prefill: tools/prefill_check.c $(SRC) metal/dsm.metal
 	$(CC) $(CFLAGS) -o $@ tools/prefill_check.c $(SRC) $(LDFLAGS)
+bench-prefill: tools/prefill_bench.c $(SRC) metal/dsm.metal
+	$(CC) $(CFLAGS) -o $@ tools/prefill_bench.c $(SRC) $(LDFLAGS)
 clean:
-	rm -f dsm test_gguf test_quants test_server_parse check-quants check-metal-gemv check-prefill
+	rm -f dsm test_gguf test_quants test_server_parse check-quants check-metal-gemv check-prefill bench-prefill
