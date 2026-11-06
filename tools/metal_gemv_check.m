@@ -155,7 +155,9 @@ int main(int argc, char **argv) {
             const gguf_tensor *tensor = &model.gguf.tensors[i];
             if (tensor->ndim == 3 && tensor->dims[0] % 32 == 0 &&
                 matmul_supported(tensor->type) && !seen[tensor->type]) {
-                check_expert_matmul(metal, tensor); seen[tensor->type] = 1;
+                if (tensor->type == GGML_TYPE_Q8_0) check_expert(metal, tensor, 0);
+                else check_expert_matmul(metal, tensor);
+                seen[tensor->type] = 1;
             }
         }
     }
