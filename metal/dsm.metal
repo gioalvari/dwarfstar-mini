@@ -487,8 +487,8 @@ void dequantize_q8_0_t4(device const block_q8_0 *xb, short il, thread type4 & re
 
 template <typename type4x4>
 void dequantize_q2_K(device const block_q2_K *xb, short il, thread type4x4 & reg) {
-    const float d = xb->d;
-    const float min = xb->dmin;
+    const float d = float(xb->d);
+    const float min = float(xb->dmin);
     device const uint8_t * q = (device const uint8_t *)xb->qs;
     float dl, ml;
     uint8_t sc = xb->scales[il];
@@ -496,7 +496,8 @@ void dequantize_q2_K(device const block_q2_K *xb, short il, thread type4x4 & reg
     q = q + 32*(il/8) + 16*(il&1);
     il = (il/2)%4;
 
-    half  coef = il>1 ? (il>2 ? 1/64.h : 1/16.h) : (il>0 ? 1/4.h : 1.h);
+    float coef = il > 1 ? (il > 2 ? 1.f / 64.f : 1.f / 16.f) :
+                          (il > 0 ? 1.f / 4.f : 1.f);
     uchar mask = il>1 ? (il>2 ? 192    : 48)     : (il>0 ? 12    : 3);
     dl = d * (sc & 0xF) * coef, ml = min * (sc >> 4);
     for (int i = 0; i < 16; ++i) {
@@ -506,7 +507,7 @@ void dequantize_q2_K(device const block_q2_K *xb, short il, thread type4x4 & reg
 
 template <typename type4x4>
 void dequantize_q3_K(device const block_q3_K *xb, short il, thread type4x4 & reg) {
-    const half d_all = xb->d;
+    const float d_all = float(xb->d);
     device const uint8_t * q = (device const uint8_t *)xb->qs;
     device const uint8_t * h = (device const uint8_t *)xb->hmask;
     device const int8_t * scales = (device const int8_t *)xb->scales;
@@ -524,7 +525,8 @@ void dequantize_q3_K(device const block_q3_K *xb, short il, thread type4x4 & reg
     const float ml = 4.f * dl;
 
     il = (il/2) & 3;
-    const half    coef = il>1 ? (il>2 ? 1/64.h : 1/16.h) : (il>0 ? 1/4.h : 1.h);
+    const float   coef = il > 1 ? (il > 2 ? 1.f / 64.f : 1.f / 16.f) :
+                                  (il > 0 ? 1.f / 4.f : 1.f);
     const uint8_t mask = il>1 ? (il>2 ? 192    : 48)     : (il>0 ? 12    : 3);
     dl *= coef;
 
@@ -546,8 +548,8 @@ void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & re
     q = q + (il/4) * 32 + 16 * (il&1);
     il = il & 3;
     const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
-    const float d   = il < 2 ? xb->d : xb->d / 16.h;
-    const float min = xb->dmin;
+    const float d   = float(xb->d) / (il < 2 ? 1.f : 16.f);
+    const float min = float(xb->dmin);
     const float dl = d * sc[0];
     const float ml = min * sc[1];
 
