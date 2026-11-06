@@ -23,5 +23,9 @@ int dsm_metal_matmul_test(dsm_metal *state, const gguf_tensor *weights,
 int dsm_metal_expert_matvec_test(dsm_metal *state, const gguf_tensor *weights,
                                  uint32_t expert, const float *input,
                                  float *output);
+int dsm_metal_expert_matmul_test(dsm_metal *state, const gguf_tensor *weights,
+                                 const float *input, const uint32_t *ids,
+                                 uint32_t rows, uint32_t input_rows,
+                                 float *output);
 
 #endif

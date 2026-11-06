@@ -78,6 +78,57 @@ static void check_expert(dsm_metal *metal, const gguf_tensor *weights, uint32_t 
     if (bad != out) printf("  first_bad_row=%llu cpu=%.8g gpu=%.8g\n", (unsigned long long)bad, cpu[bad], gpu[bad]);
     free(x); free(cpu); free(gpu);
 }
+static void check_expert_matmul(dsm_metal *metal, const gguf_tensor *weights) {
+    enum { rows = 37, slots = 8 };
+    uint64_t in = weights->dims[0], out = weights->dims[1], experts = weights->dims[2];
+    float *x = malloc((size_t)rows * in * sizeof(*x));
+    float *cpu = calloc((size_t)rows * slots * out, sizeof(*cpu));
+    float *gpu = calloc((size_t)rows * slots * out, sizeof(*gpu));
+    uint32_t *ids = malloc((size_t)rows * slots * sizeof(*ids));
+    uint32_t state = 1;
+    if (!x || !cpu || !gpu || !ids) { fprintf(stderr, "out of memory\n"); exit(1); }
+    for (uint64_t i = 0; i < (uint64_t)rows * in; ++i) x[i] = random_value(&state);
+    for (uint32_t token = 0; token < rows; ++token) {
+        for (uint32_t slot = 0; slot < slots; ++slot) {
+            ids[token * slots + slot] = slot < 4 ? 0 : (token + 3 * slot) % experts;
+        }
+    }
+    const ggml_type_info *info = gguf_type_info(weights->type);
+    uint64_t expert_stride = weights->bytes / experts;
+    uint64_t row_stride = in / info->block_elems * info->block_bytes;
+    for (uint32_t token = 0; token < rows; ++token) {
+        for (uint32_t slot = 0; slot < slots; ++slot) {
+            const uint8_t *base = (const uint8_t *)weights->data +
+                                  (uint64_t)ids[token * slots + slot] * expert_stride;
+            float *dst = cpu + ((uint64_t)token * slots + slot) * out;
+            for (uint64_t row = 0; row < out; ++row) {
+                dst[row] = dsm_dot_row(weights->type, base + row * row_stride,
+                                       x + (uint64_t)token * in, in);
+            }
+        }
+    }
+    if (!dsm_metal_expert_matmul_test(metal, weights, x, ids, rows, 1, gpu)) {
+        fprintf(stderr, "Metal expert mul_mm_id failed\n"); exit(1);
+    }
+    float max_abs = 0, max_rel = 0;
+    double error_sq = 0, reference_sq = 0;
+    for (uint64_t i = 0; i < (uint64_t)rows * slots * out; ++i) {
+        float abs = fabsf(cpu[i] - gpu[i]);
+        float rel = abs / fmaxf(fabsf(cpu[i]), 1e-2f);
+        if (abs > max_abs) max_abs = abs;
+        if (rel > max_rel) max_rel = rel;
+        error_sq += (double)abs * abs;
+        reference_sq += (double)cpu[i] * cpu[i];
+    }
+    float rel_err = sqrtf((float)(error_sq / reference_sq));
+    printf("mul_mm_id %-18.*s type=%-5s rows=%u max_abs=%.8g max_rel=%.8g rel_err=%.8g\n",
+           (int)weights->name.len, weights->name.ptr, info->name, rows, max_abs,
+           max_rel, rel_err);
+    if (!(rel_err < 2e-3f)) {
+        fprintf(stderr, "mul_mm_id relative error exceeded 2e-3\n"); exit(1);
+    }
+    free(x); free(cpu); free(gpu); free(ids);
+}
 int main(int argc, char **argv) {
     if (argc != 2 && argc != 4) { fprintf(stderr, "usage: %s MODEL.gguf [TENSOR EXPERT_ID]\n", argv[0]); return 2; }
     dsm_model model; char error[256]; if (!dsm_model_open(&model, argv[1])) { fprintf(stderr, "%s\n", model.error); return 1; }
@@ -96,6 +147,14 @@ int main(int argc, char **argv) {
             if (tensor->ndim == 2 && tensor->dims[0] % 32 == 0 &&
                 matmul_supported(tensor->type) && !seen[tensor->type]) {
                 check_matmul(metal, tensor); seen[tensor->type] = 1;
+            }
+        }
+        memset(seen, 0, sizeof(seen));
+        for (uint64_t i = 0; i < model.gguf.n_tensors; ++i) {
+            const gguf_tensor *tensor = &model.gguf.tensors[i];
+            if (tensor->ndim == 3 && tensor->dims[0] % 32 == 0 &&
+                matmul_supported(tensor->type) && !seen[tensor->type]) {
+                check_expert_matmul(metal, tensor); seen[tensor->type] = 1;
             }
         }
     }

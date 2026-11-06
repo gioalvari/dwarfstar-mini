@@ -2,6 +2,8 @@
 using namespace metal;
 
 struct MulMm { int ne00, ne02; ulong nb01, nb02, nb03; int ne12; ulong nb10, nb11, nb12, nb13; int ne0, ne1; short r2, r3; };
+struct MulMmIdMap0 { int ne10, ne11; ulong nb11, nb12; int ne21, ne20; ulong nb21; };
+struct MulMmId { int ne00, ne02; ulong nb01, nb02, nb03; int ne11; ulong nb10, nb11, nb12, nb13; int ne20, ne0, ne1; short r2, r3; };
 
 struct ggml_metal_kargs_mul_mv {
     int ne00, ne01, ne02;
@@ -813,6 +815,160 @@ template [[host_name("mul_mm_q2_K")]] kernel dsm_mul_mm_t kernel_mul_mm<half, ha
 template [[host_name("mul_mm_q3_K")]] kernel dsm_mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q3_K, QK_NL, dequantize_q3_K, float, float4x4, float, float2x4>;
 template [[host_name("mul_mm_q4_K")]] kernel dsm_mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
 template [[host_name("mul_mm_q6_K")]] kernel dsm_mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
+
+kernel void mul_mm_id_map0(
+        constant MulMmIdMap0 & args [[buffer(0)]],
+        device const int32_t * src2 [[buffer(1)]],
+        device uint * tpe [[buffer(2)]],
+        device int32_t * hids [[buffer(3)]],
+        threadgroup uint * shmem [[threadgroup(0)]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+    const uint expert = tid;
+    const uint experts = uint(args.ne10);
+    const uint slots = uint(args.ne20);
+    threadgroup uint * counts = shmem;
+    threadgroup uint * bases = counts + experts;
+
+    uint count = 0;
+    for (uint token = 0; token < uint(args.ne21); ++token) {
+        device const int32_t * ids = (device const int32_t *)((device const char *)src2 + token * args.nb21);
+        for (uint slot = 0; slot < slots; ++slot) count += ids[slot] == int(expert);
+    }
+    counts[expert] = count;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        uint base = 0;
+        uint tile = 0;
+        for (uint e = 0; e < experts; ++e) {
+            bases[e] = base;
+            for (uint k = 0; k < counts[e]; k += 32) {
+                tpe[1 + 3 * tile] = e;
+                tpe[1 + 3 * tile + 1] = base + k;
+                tpe[1 + 3 * tile + 2] = min(counts[e] - k, 32u);
+                ++tile;
+            }
+            base += counts[e] + 1;
+        }
+        tpe[0] = tile;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint entry = bases[expert];
+    for (uint token = 0; token < uint(args.ne21); ++token) {
+        device const int32_t * ids = (device const int32_t *)((device const char *)src2 + token * args.nb21);
+        for (uint slot = 0; slot < slots; ++slot) {
+            if (ids[slot] == int(expert)) hids[entry++] = int32_t(token * slots + slot);
+        }
+    }
+}
+
+template<
+    typename S0, typename S0_4x4, typename S0_8x8,
+    typename S1, typename S1_2x4, typename S1_8x8,
+    typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &),
+    typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+kernel void kernel_mul_mm_id(
+        constant MulMmId & args [[buffer(0)]],
+        device const char * src0 [[buffer(1)]],
+        device const char * src1 [[buffer(2)]],
+        device const uint * tpe [[buffer(3)]],
+        device const int32_t * hids [[buffer(4)]],
+        device char * dst [[buffer(5)]],
+        threadgroup char * shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup S0 * sa = (threadgroup S0 *)shmem;
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK = 32;
+    constexpr int NL0 = NK / 16;
+    constexpr int NL1 = NK / 8;
+    const int tile = tgpig.x;
+    const int r0 = tgpig.y * NR0;
+    if (tile >= int(tpe[0])) return;
+    const int expert = tpe[1 + 3 * tile];
+    const int id_base = tpe[1 + 3 * tile + 1];
+    const short nr1 = short(min(tpe[1 + 3 * tile + 2], uint(NR1)));
+    const short nr0 = args.ne0 - r0 < NR0 ? args.ne0 - r0 : NR0;
+    const short lr0 = short(tiitg / NL0) < nr0 ? short(tiitg / NL0) : nr0 - 1;
+    const short il0 = tiitg % NL0;
+    const short lr1 = short(tiitg / NL1) < nr1 ? short(tiitg / NL1) : nr1 - 1;
+    const short iy = 8 * (tiitg % NL1);
+    const int id = hids[id_base + lr1];
+    const short i11 = (id % args.ne20) % args.ne11;
+    const int i12 = id / args.ne20;
+    const uint64_t offset0 = uint64_t(expert) * args.nb02;
+    const short offset1 = il0 / nl;
+    device const block_q * x = (device const block_q *)(src0 + args.nb01 * (r0 + lr0) + offset0) + offset1;
+    device const T1 * y = (device const T1 *)(src1 + args.nb12 * i12 + args.nb11 * i11 + args.nb10 * iy);
+    S0_8x8 ma[4];
+    S1_8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    const bool sg_active = nr1 > NR1 / 2 || sgitg < 2;
+    short il = il0;
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        S0_4x4 temp_a;
+        dequantize_func(x, il, temp_a);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short i = 0; i < 16; ++i) {
+            const short sx = 2 * il0 + i / 8;
+            const short sy = (tiitg / NL0) / 8;
+            const short lx = (tiitg / NL0) % 8;
+            const short ly = i % 8;
+            const short ib = 8 * sx + sy;
+            *(sa + 64 * ib + 8 * ly + lx) = temp_a[i / 4][i % 4];
+        }
+        const short sx = tiitg % NL1;
+        const short sy = (tiitg / NL1) / 8;
+        const short ly = (tiitg / NL1) % 8;
+        const short ib = 4 * sx + sy;
+        *(threadgroup S1_2x4 *)(sb + 64 * ib + 8 * ly) = (S1_2x4)(*((device T1_2x4 *)y));
+        il = il + 2 < nl ? il + 2 : il % 2;
+        x = il < 2 ? x + (2 + nl - 1) / nl : x;
+        y += NK;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_active) {
+            threadgroup const S0 * lsma = sa + 4 * 64 * (sgitg % 2);
+            threadgroup const S1 * lsmb = sb + 2 * 64 * (sgitg / 2);
+            for (short ik = 0; ik < NK / 8; ++ik) {
+                simdgroup_barrier(mem_flags::mem_none);
+                for (short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+                simdgroup_barrier(mem_flags::mem_none);
+                for (short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+                simdgroup_barrier(mem_flags::mem_none);
+                for (short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+                lsma += 8 * 64;
+                lsmb += 4 * 64;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_active) {
+        threadgroup float * temp = (threadgroup float *)shmem + 32 * (sgitg & 1) + 16 * (sgitg >> 1) * NR0;
+        for (short i = 0; i < 8; ++i) simdgroup_store(mc[i], temp + 8 * (i % 4) + 8 * NR0 * (i / 4), NR0, 0, false);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short j = sgitg; j < nr1; j += 4) {
+        const int output_id = hids[id_base + j];
+        const short slot = output_id % args.ne20;
+        const int token = output_id / args.ne20;
+        device float * out = (device float *)dst + r0 + uint64_t(slot) * args.ne0 + uint64_t(token) * args.ne1 * args.ne0;
+        threadgroup float * in = (threadgroup float *)shmem + j * NR0;
+        for (int i = tiisg; i < nr0; i += 32) out[i] = in[i];
+    }
+}
+
+typedef decltype(kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) dsm_mul_mm_id_t;
+template [[host_name("mul_mm_id_q8_0")]] kernel dsm_mul_mm_id_t kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
+template [[host_name("mul_mm_id_q2_K")]] kernel dsm_mul_mm_id_t kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>;
+template [[host_name("mul_mm_id_q3_K")]] kernel dsm_mul_mm_id_t kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q3_K, QK_NL, dequantize_q3_K, float, float4x4, float, float2x4>;
+template [[host_name("mul_mm_id_q4_K")]] kernel dsm_mul_mm_id_t kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
+template [[host_name("mul_mm_id_q6_K")]] kernel dsm_mul_mm_id_t kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
 
 kernel void rmsnorm(device const float *x [[buffer(0)]], device const float *w [[buffer(1)]],
                     device float *out [[buffer(2)]], constant Norm &p [[buffer(3)]],
