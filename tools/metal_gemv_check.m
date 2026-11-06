@@ -79,15 +79,16 @@ static void check_expert(dsm_metal *metal, const gguf_tensor *weights, uint32_t 
     free(x); free(cpu); free(gpu);
 }
 static void check_expert_matmul(dsm_metal *metal, const gguf_tensor *weights) {
-    enum { rows = 37, slots = 8 };
+    enum { rows = 64, slots = 8 };
     uint64_t in = weights->dims[0], out = weights->dims[1], experts = weights->dims[2];
-    float *x = malloc((size_t)rows * in * sizeof(*x));
+    uint32_t input_rows = strstr(weights->name.ptr, "ffn_down_exps") ? slots : 1;
+    float *x = malloc((size_t)rows * input_rows * in * sizeof(*x));
     float *cpu = calloc((size_t)rows * slots * out, sizeof(*cpu));
     float *gpu = calloc((size_t)rows * slots * out, sizeof(*gpu));
     uint32_t *ids = malloc((size_t)rows * slots * sizeof(*ids));
     uint32_t state = 1;
     if (!x || !cpu || !gpu || !ids) { fprintf(stderr, "out of memory\n"); exit(1); }
-    for (uint64_t i = 0; i < (uint64_t)rows * in; ++i) x[i] = random_value(&state);
+    for (uint64_t i = 0; i < (uint64_t)rows * input_rows * in; ++i) x[i] = random_value(&state);
     for (uint32_t token = 0; token < rows; ++token) {
         for (uint32_t slot = 0; slot < slots; ++slot) {
             ids[token * slots + slot] = slot < 4 ? 0 : (token + 3 * slot) % experts;
@@ -103,11 +104,11 @@ static void check_expert_matmul(dsm_metal *metal, const gguf_tensor *weights) {
             float *dst = cpu + ((uint64_t)token * slots + slot) * out;
             for (uint64_t row = 0; row < out; ++row) {
                 dst[row] = dsm_dot_row(weights->type, base + row * row_stride,
-                                       x + (uint64_t)token * in, in);
+                                       x + ((uint64_t)token * input_rows + slot % input_rows) * in, in);
             }
         }
     }
-    if (!dsm_metal_expert_matmul_test(metal, weights, x, ids, rows, 1, gpu)) {
+    if (!dsm_metal_expert_matmul_test(metal, weights, x, ids, rows, input_rows, gpu)) {
         fprintf(stderr, "Metal expert mul_mm_id failed\n"); exit(1);
     }
     float max_abs = 0, max_rel = 0;

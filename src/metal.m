@@ -308,9 +308,10 @@ static void encode_moe_gate_up(dsm_metal *s, id<MTLComputeCommandEncoder> e, con
     const dsm_model *m = s->m;
     encode_expert_gemv(s, e, w->gate_exps, s->norm_x, s->gate);
     encode_expert_gemv(s, e, w->up_exps, s->norm_x, s->up);
+    uint32_t rows = 1;
     [e setComputePipelineState:s->expert_swiglu]; [e setBuffer:s->gate offset:0 atIndex:0];
     [e setBuffer:s->up offset:0 atIndex:1]; [e setBytes:&m->expert_hidden length:sizeof(m->expert_hidden) atIndex:2];
-    [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:3];
+    [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:3]; [e setBytes:&rows length:sizeof(rows) atIndex:4];
     dispatch_1d(e, s->expert_swiglu, m->expert_hidden * m->experts_used);
 }
 static void encode_moe_down(dsm_metal *s, id<MTLComputeCommandEncoder> e, const dsm_layer *w) {
@@ -678,7 +679,7 @@ static void encode_layer_batch(dsm_metal *s, id<MTLComputeCommandEncoder> e,
                         encode_expert_matmul(s, e, w->up_exps, s->bnorm, s->bup,
                                              rows, 1, m->dim, m->expert_hidden);
         if (use_mm_id) {
-            [e setComputePipelineState:s->expert_swiglu]; [e setBuffer:s->bgate offset:0 atIndex:0]; [e setBuffer:s->bup offset:0 atIndex:1]; [e setBytes:&m->expert_hidden length:sizeof(m->expert_hidden) atIndex:2]; [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:3]; dispatch_1d(e, s->expert_swiglu, rows * m->expert_hidden * m->experts_used);
+            [e setComputePipelineState:s->expert_swiglu]; [e setBuffer:s->bgate offset:0 atIndex:0]; [e setBuffer:s->bup offset:0 atIndex:1]; [e setBytes:&m->expert_hidden length:sizeof(m->expert_hidden) atIndex:2]; [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:3]; [e setBytes:&rows length:sizeof(rows) atIndex:4]; dispatch_1d(e, s->expert_swiglu, rows * m->expert_hidden * m->experts_used);
             use_mm_id = encode_expert_matmul(s, e, w->down_exps, s->bgate, s->btmp,
                                               rows, m->experts_used, m->expert_hidden, m->dim);
         }
@@ -689,7 +690,8 @@ static void encode_layer_batch(dsm_metal *s, id<MTLComputeCommandEncoder> e,
                 NSUInteger tmp_off = (NSUInteger)row * m->experts_used * m->dim * sizeof(float);
                 encode_expert_gemv_batch_row(s, e, w->gate_exps, s->bnorm, x_off, s->bgate, gate_off, row, 0, m->expert_hidden);
                 encode_expert_gemv_batch_row(s, e, w->up_exps, s->bnorm, x_off, s->bup, gate_off, row, 0, m->expert_hidden);
-                [e setComputePipelineState:s->expert_swiglu]; [e setBuffer:s->bgate offset:gate_off atIndex:0]; [e setBuffer:s->bup offset:gate_off atIndex:1]; [e setBytes:&m->expert_hidden length:sizeof(m->expert_hidden) atIndex:2]; [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:3]; dispatch_1d(e, s->expert_swiglu, m->expert_hidden * m->experts_used);
+                uint32_t single_row = 1;
+                [e setComputePipelineState:s->expert_swiglu]; [e setBuffer:s->bgate offset:gate_off atIndex:0]; [e setBuffer:s->bup offset:gate_off atIndex:1]; [e setBytes:&m->expert_hidden length:sizeof(m->expert_hidden) atIndex:2]; [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:3]; [e setBytes:&single_row length:sizeof(single_row) atIndex:4]; dispatch_1d(e, s->expert_swiglu, m->expert_hidden * m->experts_used);
                 encode_expert_gemv_batch_row(s, e, w->down_exps, s->bgate, gate_off, s->btmp, tmp_off, row, m->expert_hidden, m->dim);
             }
         }

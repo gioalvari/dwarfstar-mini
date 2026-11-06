@@ -1251,7 +1251,7 @@ kernel void moe_add_batch(device float *x [[buffer(0)]], device const float *exp
 }
 
 kernel void expert_swiglu(device float *gate [[buffer(0)]], device const float *up [[buffer(1)]],
-                          constant uint &width [[buffer(2)]], constant uint &slots [[buffer(3)]],
-                          uint i [[thread_position_in_grid]]) {
-    if (i < width*slots) { float x=gate[i]; gate[i]=(x/(1.0f+exp(-x)))*up[i]; }
+                           constant uint &width [[buffer(2)]], constant uint &slots [[buffer(3)]],
+                           constant uint &rows [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    if (i < width * slots * rows) { float x=gate[i]; gate[i]=(x/(1.0f+exp(-x)))*up[i]; }
 }
