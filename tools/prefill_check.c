@@ -107,17 +107,41 @@ int main(int argc, char **argv) {
         goto done;
     }
     float max_abs = 0;
+    uint32_t non_finite = 0;
+    double max_ref = -INFINITY, max_pre = -INFINITY, z_ref = 0, z_pre = 0;
     for (uint32_t i = 0; i < model.vocab; ++i) {
         float diff = fabsf(reference[i] - prefill[i]);
         if (diff > max_abs) max_abs = diff;
+        non_finite += !isfinite(reference[i]) || !isfinite(prefill[i]);
+        if (reference[i] > max_ref) max_ref = reference[i];
+        if (prefill[i] > max_pre) max_pre = prefill[i];
+    }
+    for (uint32_t i = 0; i < model.vocab; ++i) {
+        z_ref += exp(reference[i] - max_ref);
+        z_pre += exp(prefill[i] - max_pre);
+    }
+    double kl = 0, max_dprob = 0;
+    for (uint32_t i = 0; i < model.vocab; ++i) {
+        double p = exp(reference[i] - max_ref) / z_ref;
+        double q = exp(prefill[i] - max_pre) / z_pre;
+        if (p > 0 && q > 0) kl += p * log(p / q);
+        if (fabs(p - q) > max_dprob) max_dprob = fabs(p - q);
+    }
+    if (non_finite) {
+        fprintf(stderr, "non-finite logits: %u\n", non_finite);
+        goto done;
     }
     uint32_t reference_argmax = argmax(reference, model.vocab);
     uint32_t prefill_argmax = argmax(prefill, model.vocab);
-    printf("tokens=%zu max_abs=%.8g argmax=%u/%u\n", tokens.len, max_abs,
-           reference_argmax, prefill_argmax);
+    printf("tokens=%zu max_abs=%.8g kl=%.3g max_dprob=%.3g argmax=%u/%u\n",
+           tokens.len, max_abs, kl, max_dprob, reference_argmax, prefill_argmax);
     int top_k_ok = same_top_k(reference, prefill, model.vocab);
     printf("top%d=%s\n", TOP_K, top_k_ok ? "same" : "different");
-    if (!(max_abs < 5e-2f) || reference_argmax != prefill_argmax || !top_k_ok) {
+    /* MoE top-k routing is discontinuous at near-ties: ~1e-6 summation-order noise
+       can swap the 8th/9th expert and move tail logits by ~1 while the output
+       distribution is unchanged, so MoE models are gated on KL and max |dprob|. */
+    int logits_ok = model.is_moe ? kl < 1e-4 && max_dprob < 1e-3 : max_abs < 5e-2f;
+    if (!logits_ok || reference_argmax != prefill_argmax || !top_k_ok) {
         fprintf(stderr, "prefill parity failed\n");
         goto done;
     }
