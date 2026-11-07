@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 enum { REF_VERSION = 2, REF_HEADER_BYTES = 32, REF_BATCH = 512 };
 
@@ -45,7 +46,8 @@ static void usage(const char *argv0) {
             "usage: %s MODEL.gguf IDS.txt OUT.bin [options]\n"
             "       %s MODEL.gguf ID [ID ...] --out OUT.bin [options]\n"
             "options: --ngl 0|all|N  --logits-at all|last|K,K,...\n"
-            "         --dump-tensors PATTERNS --tensor-dir DIR --greedy N\n",
+            "         --dump-tensors PATTERNS --tensor-dir DIR --greedy N\n"
+            "IDS.txt accepts whitespace/comma-separated ids or llama-tokenize's [id,...] form.\n",
             argv0, argv0);
 }
 
@@ -181,7 +183,8 @@ int main(int argc, char **argv) {
     model_path = argv[1];
     ids_path = argv[2];
     int arg = 3;
-    if (strchr(ids_path, '/') || strchr(ids_path, '.')) {
+    struct stat input_stat;
+    if (!stat(ids_path, &input_stat) && S_ISREG(input_stat.st_mode)) {
         out_path = argv[arg++];
     } else {
         while (arg < argc && strncmp(argv[arg], "--", 2)) {
@@ -277,7 +280,6 @@ int main(int argc, char **argv) {
     logit_row = malloc((size_t)vocab * sizeof(*logit_row));
     if (!logit_row) goto done;
 
-    uint32_t output = 0;
     for (uint32_t start = 0; start < n_ids; start += REF_BATCH) {
         uint32_t count = (uint32_t)n_ids - start;
         if (count > REF_BATCH) count = REF_BATCH;
@@ -296,7 +298,7 @@ int main(int argc, char **argv) {
         }
         for (uint32_t i = 0; i < count; ++i) {
             if (!batch.logits[i]) continue;
-            float *source = llama_get_logits_ith(context, (int32_t)output++);
+            float *source = llama_get_logits_ith(context, (int32_t)i);
             if (!source) {
                 fprintf(stderr, "llama-ref: missing logits at input position %u\n", start + i);
                 goto done;

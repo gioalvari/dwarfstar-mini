@@ -37,6 +37,7 @@ static void usage(const char *argv0) {
             "usage: %s MODEL.gguf IDS.txt LLAMA.bin [--backend metal|cpu]\n"
             "       [--floor F] [--dump-dsm DSM.bin | --dsm-dump DSM.bin]\n",
             argv0);
+    fprintf(stderr, "       %s --compare-dumps REF.bin TEST.bin [--floor F]\n", argv0);
 }
 
 static bool append_id(int32_t **ids, size_t *len, size_t *cap, long value) {
@@ -147,6 +148,74 @@ static int compare_kl(const void *left, const void *right) {
     return (a > b) - (a < b);
 }
 
+static int compare_dumps(const char *reference_path, const char *test_path,
+                         double floor) {
+    FILE *reference_file = fopen(reference_path, "rb");
+    FILE *test_file = fopen(test_path, "rb");
+    ref_header reference_header, test_header;
+    float *reference = NULL, *test = NULL;
+    double *kls = NULL;
+    int status = 1;
+    if (!reference_file || !test_file ||
+        fread(&reference_header, sizeof(reference_header), 1, reference_file) != 1 ||
+        fread(&test_header, sizeof(test_header), 1, test_file) != 1 ||
+        !valid_header(&reference_header) || !valid_header(&test_header) ||
+        reference_header.vocab != test_header.vocab ||
+        reference_header.n_positions != test_header.n_positions) {
+        fprintf(stderr, "check-ref: incompatible dump headers\n");
+        goto done;
+    }
+    reference = malloc((size_t)reference_header.vocab * sizeof(*reference));
+    test = malloc((size_t)reference_header.vocab * sizeof(*test));
+    kls = malloc((size_t)reference_header.n_positions * sizeof(*kls));
+    if (!reference || !test || !kls) {
+        fprintf(stderr, "check-ref: out of memory\n");
+        goto done;
+    }
+    double max_kl = 0, sum_overlap = 0;
+    float max_abs = 0;
+    uint32_t top1_matches = 0;
+    for (uint32_t row = 0; row < reference_header.n_positions; ++row) {
+        uint32_t reference_position, test_position;
+        if (fread(&reference_position, sizeof(reference_position), 1, reference_file) != 1 ||
+            fread(reference, sizeof(*reference), reference_header.vocab, reference_file) != reference_header.vocab ||
+            fread(&test_position, sizeof(test_position), 1, test_file) != 1 ||
+            fread(test, sizeof(*test), test_header.vocab, test_file) != test_header.vocab ||
+            reference_position != test_position) {
+            fprintf(stderr, "check-ref: dump records differ or are truncated at row %u\n", row);
+            goto done;
+        }
+        comparison result = compare(reference, test, reference_header.vocab);
+        kls[row] = result.kl;
+        if (result.kl > max_kl) max_kl = result.kl;
+        if (result.max_abs > max_abs) max_abs = result.max_abs;
+        top1_matches += result.ref_top1 == result.dsm_top1;
+        sum_overlap += overlap(result.ref_top5, result.dsm_top5);
+        printf("position=%u kl=%.8g max_abs_dlogit=%.8g top1=%s top5_overlap=%u/%u\n",
+               reference_position, result.kl, result.max_abs,
+               result.ref_top1 == result.dsm_top1 ? "match" : "different",
+               overlap(result.ref_top5, result.dsm_top5), TOP_K);
+    }
+    qsort(kls, reference_header.n_positions, sizeof(*kls), compare_kl);
+    double median = kls[reference_header.n_positions / 2];
+    double gate_kl = fmax(1e-3, 3.0 * floor);
+    double top1_percent = 100.0 * top1_matches / reference_header.n_positions;
+    double top5_percent = 100.0 * sum_overlap / (TOP_K * reference_header.n_positions);
+    bool pass = median <= gate_kl && max_kl <= 1e-2 && top1_percent >= 99.0;
+    printf("summary positions=%u kl_median=%.8g kl_max=%.8g top1_match=%.4f%% "
+           "top5_overlap=%.4f%% max_abs_dlogit=%.8g gate_kl=%.8g %s\n",
+           reference_header.n_positions, median, max_kl, top1_percent, top5_percent,
+           max_abs, gate_kl, pass ? "PASS" : "FAIL");
+    status = pass ? 0 : 1;
+done:
+    if (reference_file) fclose(reference_file);
+    if (test_file) fclose(test_file);
+    free(kls);
+    free(test);
+    free(reference);
+    return status;
+}
+
 int main(int argc, char **argv) {
     const char *model_path, *ids_path, *reference_path, *backend = "metal";
     const char *dsm_dump_path = NULL, *write_dsm_path = NULL;
@@ -162,6 +231,19 @@ int main(int argc, char **argv) {
     double *kls = NULL;
     int status = 1;
 
+    if (argc >= 4 && !strcmp(argv[1], "--compare-dumps")) {
+        double floor = 0;
+        if (argc == 6 && !strcmp(argv[4], "--floor")) floor = strtod(argv[5], NULL);
+        else if (argc != 4) {
+            usage(argv[0]);
+            return 2;
+        }
+        if (floor < 0 || !isfinite(floor)) {
+            fprintf(stderr, "check-ref: --floor must be finite and non-negative\n");
+            return 2;
+        }
+        return compare_dumps(argv[2], argv[3], floor);
+    }
     if (argc < 4) {
         usage(argv[0]);
         return 2;
