@@ -18,6 +18,7 @@ struct Norm { uint width, groups; float eps; };
 struct Rope { uint heads, dim, pos; float base; };
 struct Cache { uint layer, pos, context, width; };
 struct Attention { uint heads, kv_heads, dim, pos, context, layer; };
+struct AttentionSplit { uint heads, kv_heads, dim, pos, context, layer, splits; };
 struct RopeBatch { uint heads, dim, pos0, rows; float base; };
 struct CacheBatch { uint layer, pos0, context, width, rows; };
 struct AttentionPrefill { uint heads, kv_heads, dim, pos0, context, layer, rows; };
@@ -1034,6 +1035,123 @@ kernel void attention_decode(device const float *q [[buffer(0)]], device const f
     for (uint step = 128; step; step >>= 1) { if (tid < step) reduce[tid] += reduce[tid + step]; threadgroup_barrier(mem_flags::mem_threadgroup); }
     float inv_sum = 1.0f / reduce[0];
     for (uint j = tid; j < p.dim; j += 256) { float value = 0; for (uint pos = 0; pos <= p.pos; ++pos) value += head_scores[pos] * inv_sum * values[((p.layer * p.context + pos) * width + kvh * p.dim + j)]; out[head * p.dim + j] = value; }
+}
+
+// Decode attention is split across 64-token chunks.  The first pass leaves
+// each chunk in online-softmax form (maximum, denominator, numerator vector),
+// so the second pass can combine chunks without materializing all scores.
+kernel void attention_decode_split(device const float *q [[buffer(0)]],
+                                   device const float *keys [[buffer(1)]],
+                                   device const float *values [[buffer(2)]],
+                                   device float *partial [[buffer(3)]],
+                                   constant AttentionSplit &p [[buffer(4)]],
+                                   ushort tid [[thread_index_in_threadgroup]],
+                                   ushort lane [[thread_index_in_simdgroup]],
+                                   ushort simdgroup [[simdgroup_index_in_threadgroup]],
+                                   uint2 group [[threadgroup_position_in_grid]],
+                                   threadgroup float *scratch [[threadgroup(0)]]) {
+    constexpr uint CHUNK = 64;
+    uint split = group.x, head = group.y;
+    if (head >= p.heads || split >= p.splits) return;
+    uint start = split * CHUNK;
+    uint count = min(CHUNK, p.pos + 1 - start);
+    uint kvh = head / (p.heads / p.kv_heads);
+    uint width = p.kv_heads * p.dim;
+    threadgroup float *scores = scratch;
+    threadgroup float *reduce = scratch + CHUNK;
+
+    // Eight simdgroups compute eight 128-wide QK dots at a time.  A lane owns
+    // four elements, with the loop retaining support for non-128 dimensions.
+    for (uint base = 0; base < count; base += 8) {
+        uint index = base + simdgroup;
+        float dot = 0.0f;
+        if (index < count) {
+            device const float *key = keys +
+                ((p.layer * p.context + start + index) * width + kvh * p.dim);
+            device const float *query = q + head * p.dim;
+            for (uint z = lane * 4; z < p.dim; z += 128) {
+                dot += query[z] * key[z];
+                if (z + 1 < p.dim) dot += query[z + 1] * key[z + 1];
+                if (z + 2 < p.dim) dot += query[z + 2] * key[z + 2];
+                if (z + 3 < p.dim) dot += query[z + 3] * key[z + 3];
+            }
+        }
+        dot = simd_sum(dot);
+        if (lane == 0 && index < count) scores[index] = dot * rsqrt(float(p.dim));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    reduce[tid] = tid < count ? scores[tid] : -INFINITY;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) {
+        if (tid < step) reduce[tid] = max(reduce[tid], reduce[tid + step]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float maximum = reduce[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float local_sum = tid < count ? exp(scores[tid] - maximum) : 0.0f;
+    reduce[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) {
+        if (tid < step) reduce[tid] += reduce[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float denominator = reduce[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device float *dst = partial + (head * p.splits + split) * (p.dim + 2);
+    if (tid == 0) { dst[0] = maximum; dst[1] = denominator; }
+    for (uint j = tid; j < p.dim; j += 256) {
+        float numerator = 0.0f;
+        for (uint i = 0; i < count; ++i) {
+            float weight = exp(scores[i] - maximum);
+            numerator += weight * values[((p.layer * p.context + start + i) * width +
+                                           kvh * p.dim + j)];
+        }
+        dst[j + 2] = numerator;
+    }
+}
+
+kernel void attention_decode_merge(device const float *partial [[buffer(0)]],
+                                   device float *out [[buffer(1)]],
+                                   constant AttentionSplit &p [[buffer(2)]],
+                                   ushort tid [[thread_index_in_threadgroup]],
+                                   uint head [[threadgroup_position_in_grid]],
+                                   threadgroup float *reduce [[threadgroup(0)]]) {
+    if (head >= p.heads) return;
+    uint stride = p.dim + 2;
+    float local_maximum = -INFINITY;
+    for (uint split = tid; split < p.splits; split += 256)
+        local_maximum = max(local_maximum, partial[(head * p.splits + split) * stride]);
+    reduce[tid] = local_maximum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) {
+        if (tid < step) reduce[tid] = max(reduce[tid], reduce[tid + step]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float maximum = reduce[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float local_sum = 0.0f;
+    for (uint split = tid; split < p.splits; split += 256) {
+        device const float *src = partial + (head * p.splits + split) * stride;
+        local_sum += src[1] * exp(src[0] - maximum);
+    }
+    reduce[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) {
+        if (tid < step) reduce[tid] += reduce[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float denominator = reduce[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint j = tid; j < p.dim; j += 256) {
+        float numerator = 0.0f;
+        for (uint split = 0; split < p.splits; ++split) {
+            device const float *src = partial + (head * p.splits + split) * stride;
+            numerator += src[j + 2] * exp(src[0] - maximum);
+        }
+        out[head * p.dim + j] = numerator / denominator;
+    }
 }
 
 // Tiled online flash attention.  One threadgroup owns four query rows for one
