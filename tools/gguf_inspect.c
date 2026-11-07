@@ -1,9 +1,40 @@
-#include "gguf.h"
+#include "model.h"
 
 #include <stdio.h>
 #include <string.h>
 
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[2], "--layers")) {
+        dsm_model model;
+        if (!dsm_model_open(&model, argv[1])) {
+            fprintf(stderr, "gguf-inspect: %s\n", model.error);
+            return 1;
+        }
+        if (model.arch != DSM_ARCH_QWEN35 && model.arch != DSM_ARCH_QWEN35MOE) {
+            fprintf(stderr, "gguf-inspect: --layers is only available for qwen35 models\n");
+            dsm_model_close(&model);
+            return 1;
+        }
+        uint64_t mapped, unknown;
+        dsm_model_tensor_summary(&model, &mapped, &unknown);
+        printf("L ");
+        for (uint32_t begin = 0; begin < model.layers;) {
+            uint32_t end = begin + 1;
+            while (end < model.layers &&
+                   model.is_recurrent[end] == model.is_recurrent[begin]) ++end;
+            if (end - begin > 1) printf("%u-%u", begin, end - 1);
+            else printf("%u", begin);
+            printf(" %s%s", model.is_recurrent[begin] ? "rec" : "attn",
+                   end == model.layers ? "\n" : ", ");
+            begin = end;
+        }
+        uint32_t recurrent = model.layers - model.n_attn_layers;
+        printf("mapped tensors: %llu; unknown: %llu; DeltaNet: %u; attention: %u\n",
+               (unsigned long long)mapped, (unsigned long long)unknown, recurrent,
+               model.n_attn_layers);
+        dsm_model_close(&model);
+        return 0;
+    }
     gguf_file file;
     if ((argc != 2 && argc != 3) || !gguf_open(&file, argv[1])) return 1;
     if (argc == 3) {

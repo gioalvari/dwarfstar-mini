@@ -154,3 +154,10 @@ int gguf_array_i32_at(const gguf_file *f, const gguf_array *a, uint64_t index, i
     if (a->type != GGUF_INT32 || index >= a->len || index > (f->size - a->data_offset) / 4) return 0;
     memcpy(v, f->map + a->data_offset + index * 4, 4); return 1;
 }
+int gguf_array_bool_at(const gguf_file *f, const gguf_array *a, uint64_t index, int *v) {
+    if (a->type != GGUF_BOOL || index >= a->len || index >= f->size - a->data_offset) return 0;
+    uint8_t value = f->map[a->data_offset + index];
+    if (value > 1) return 0;
+    *v = value;
+    return 1;
+}

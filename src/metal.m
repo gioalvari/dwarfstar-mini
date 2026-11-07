@@ -407,7 +407,7 @@ int dsm_metal_init(dsm_metal **out,const dsm_model *m,uint32_t context,char *err
     NSString *source = nil;
     MTLCompileOptions *options = nil;
     id<MTLLibrary> lib = nil;
-    *out=NULL; if (!context || context > m->context) { set_error(error,error_size,"invalid Metal context"); return 0; }
+    *out=NULL; if (m->arch==DSM_ARCH_QWEN35 || m->arch==DSM_ARCH_QWEN35MOE) { set_error(error,error_size,"qwen35 models are not yet supported on Metal"); return 0; } if (!context || context > m->context) { set_error(error,error_size,"invalid Metal context"); return 0; }
     dsm_metal *s=calloc(1,sizeof(*s)); if(!s){set_error(error,error_size,"out of memory");return 0;} s->m=m;s->context=context;s->profile.enabled=getenv("DSM_PROFILE") && !strcmp(getenv("DSM_PROFILE"),"1");s->device=MTLCreateSystemDefaultDevice(); if(!s->device){set_error(error,error_size,"no Metal device");goto bad;}s->queue=[s->device newCommandQueue];
     source=[NSString stringWithContentsOfFile:shader_path() encoding:NSUTF8StringEncoding error:&ns_error];if(!source){set_error(error,error_size,ns_error.localizedDescription.UTF8String);goto bad;}options=[MTLCompileOptions new];if (@available(macOS 15.0,*)) options.mathMode=MTLMathModeSafe;
     lib=[s->device newLibraryWithSource:source options:options error:&ns_error];if(!lib){set_error(error,error_size,ns_error.localizedDescription.UTF8String);goto bad;}

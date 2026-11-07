@@ -13,6 +13,8 @@ test_quants: src/gguf.c src/quants.c tests/test_quants.c
 	$(CC) $(CFLAGS) -o $@ src/gguf.c src/quants.c tests/test_quants.c -lm
 test_server_parse: $(SRC) tests/test_server_parse.c
 	$(CC) $(CFLAGS) -o $@ $(SRC) tests/test_server_parse.c $(LDFLAGS)
+gguf-inspect: tools/gguf_inspect.c src/gguf.c src/quants.c src/model.c
+	$(CC) $(CFLAGS) -o $@ tools/gguf_inspect.c src/gguf.c src/quants.c src/model.c -lm
 test: test_gguf test_quants test_server_parse
 	./test_gguf
 	./test_quants

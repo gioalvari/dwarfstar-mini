@@ -53,6 +53,8 @@ int gguf_get_array(const gguf_file *file, const char *key, gguf_array *value);
 int gguf_array_string_at(const gguf_file *file, const gguf_array *array,
                          uint64_t index, gguf_str *value);
 int gguf_array_i32_at(const gguf_file *file, const gguf_array *array,
-                      uint64_t index, int32_t *value);
+                       uint64_t index, int32_t *value);
+int gguf_array_bool_at(const gguf_file *file, const gguf_array *array,
+                       uint64_t index, int *value);
 
 #endif
