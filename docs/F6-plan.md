@@ -213,3 +213,42 @@ The remaining throughput gap versus llama.cpp is prioritized as: fuse expert
 gate+up and share map0 / fuse SwiGLU epilogue; retile `attention_prefill` with
 simdgroup matrices; port decode `mul_mv_id` Q8_0 and parallelize `route_topk`;
 then fuse Q/K/V projections.
+
+### Decode results (2026-11-06)
+
+Decode measurements are Metal best-of-three greedy runs on M4 Pro, with `-n
+128`. `short` is `Write a short story about a lighthouse keeper.` and `570
+ctx` is the F6 prompt repeated 30 times. The 2.3k-context measurement repeats
+that prompt 120 times and uses `-n 64`. Route-topk and split-K rows use the
+same commands and model files as their preceding milestone.
+
+| milestone | model | short tok/s | 570 ctx tok/s | ~2.3k ctx tok/s |
+|---|---|---:|---:|---:|
+| before decode work | 30B-A3B asym | 45.3 | 31.6 | — |
+|  | Coder-30B-A3B Q8_0 | 25.8 | 20.3 | — |
+|  | 1.7B Q4_K_M | 117.0 | 70.0 | — |
+| after `3259e7e` Vectorize Q8_0 expert GEMV | 30B-A3B asym | 49.0 | 31.8 | — |
+|  | Coder-30B-A3B Q8_0 | 41.4 | 32.7 | — |
+|  | 1.7B Q4_K_M | 132.0 | 79.0 | — |
+| after `5e0494f` parallel route_topk | 30B-A3B asym | 63.9 | 41.0 | 19.8 |
+|  | Coder-30B-A3B Q8_0 | 52.9 | 36.7 | — |
+|  | 1.7B Q4_K_M | 127.2 | 76.9 | — |
+| after split-K flash decode | 30B-A3B asym | 64.9 | 60.4 | 48.4 |
+|  | Coder-30B-A3B Q8_0 | 55.6 | 51.2 | — |
+|  | 1.7B Q4_K_M | 131.8 | 128.5 | — |
+| llama.cpp tg128 reference | 1.7B Q4_K_M | 143.0 | — | — |
+|  | 1.7B Q8_0 | 99.3 | — | — |
+|  | 30B-A3B asym | 66.8 | — | — |
+|  | Coder-30B-A3B Q8_0 | 50.8 | — | — |
+
+`route_topk` had been a roughly 25% serial decode cost (an ablation measured
+about 45 to 60 tok/s for 30B short decode); its parallelization is
+bitwise-identical because it preserves the serial denominator accumulation.
+Split-K decode uses 64-position partial softmaxes and a log-sum-exp merge, so
+it changes floating-point summation order and is KL-gated rather than
+bit-identical. It raises the 30B 570-context case from 41.0 to 60.4 tok/s and
+the 2.3k case from 19.8 to 48.4 tok/s.
+
+Remaining work: fuse prefill expert gate+up, share map0 once, and add the
+SwiGLU epilogue; tile `attention_prefill` with simdgroup matrices; fuse Q/K/V;
+and reduce decode dispatch count.
