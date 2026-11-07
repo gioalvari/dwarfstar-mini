@@ -3,7 +3,7 @@ CFLAGS := -O3 -mcpu=native -std=c11 -Wall -Wextra -Wpedantic -Isrc
 LDFLAGS := -lm -lpthread -framework Metal -framework Foundation
 SRC := src/gguf.c src/quants.c src/model.c src/tokenizer.c src/forward.c src/sampler.c src/json.c src/server.c src/metal.m
 
-.PHONY: all clean test check-quants check-metal-gemv check-prefill bench-prefill
+.PHONY: all clean test check-quants check-metal-gemv check-prefill bench-prefill llama-ref check-ref
 all: dsm
 dsm: $(SRC) src/main.c metal/dsm.metal
 	$(CC) $(CFLAGS) -o $@ $(SRC) src/main.c $(LDFLAGS)
@@ -27,5 +27,9 @@ check-prefill: tools/prefill_check.c $(SRC) metal/dsm.metal
 	$(CC) $(CFLAGS) -o $@ tools/prefill_check.c $(SRC) $(LDFLAGS)
 bench-prefill: tools/prefill_bench.c $(SRC) metal/dsm.metal
 	$(CC) $(CFLAGS) -o $@ tools/prefill_bench.c $(SRC) $(LDFLAGS)
+llama-ref: tools/llama_ref.c
+	$(CC) -O3 -std=c11 -Wall -Wextra -Wpedantic -I/opt/homebrew/opt/llama.cpp/include -I/opt/homebrew/Cellar/ggml/0.15.3/include -o $@ tools/llama_ref.c -L/opt/homebrew/opt/llama.cpp/lib -lllama -L/opt/homebrew/Cellar/ggml/0.15.3/lib -lggml -lggml-base -Wl,-rpath,/opt/homebrew/opt/llama.cpp/lib -Wl,-rpath,/opt/homebrew/Cellar/ggml/0.15.3/lib -lm
+check-ref: tools/ref_check.c $(SRC) metal/dsm.metal
+	$(CC) $(CFLAGS) -o $@ tools/ref_check.c $(SRC) $(LDFLAGS)
 clean:
-	rm -f dsm test_gguf test_quants test_server_parse check-quants check-metal-gemv check-prefill bench-prefill
+	rm -f dsm test_gguf test_quants test_server_parse check-quants check-metal-gemv check-prefill bench-prefill llama-ref check-ref
