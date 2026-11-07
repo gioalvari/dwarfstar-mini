@@ -75,15 +75,24 @@ static bool parse_id(const char *text, int32_t **ids, size_t *len, size_t *cap) 
 static bool read_ids(const char *path, int32_t **ids, size_t *len, size_t *cap) {
     FILE *file = fopen(path, "r");
     if (!file) return false;
-    char token[64];
     bool ok = true;
-    while (fscanf(file, " %63[^, \t\r\n]", token) == 1) {
+    for (;;) {
+        int character;
+        do character = fgetc(file); while (character == '[' || character == ']' ||
+                                            character == ',' || character == ' ' ||
+                                            character == '\t' || character == '\r' ||
+                                            character == '\n');
+        if (character == EOF) break;
+        ungetc(character, file);
+        char token[64];
+        if (fscanf(file, "%63[-0123456789]", token) != 1) {
+            ok = false;
+            break;
+        }
         if (!parse_id(token, ids, len, cap)) {
             ok = false;
             break;
         }
-        int separator = fgetc(file);
-        if (separator != ',' && separator != EOF) ungetc(separator, file);
     }
     if (ferror(file)) ok = false;
     fclose(file);

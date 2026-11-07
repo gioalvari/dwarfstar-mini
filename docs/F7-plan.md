@@ -175,6 +175,12 @@ Graph details confirmed in llama.cpp source:
   prompts × 64 positions (record it). Greedy text from llama-ref is coherent.
   b9860 is older than the research commit (R11).
 
+**Result (2026-11-07, b9860):** On the 570-token repeated-prefill prompt with
+Qwen3.6-35B-A3B-UD-Q4_K_S, Metal versus CPU gave `F` (median KL) =
+`1.193815e-4`, max KL = `17.008373`, and top-1 agreement = `98.9474%`.
+The very large tail differences mean this one build/backend pair is not yet a
+passing oracle floor; retain the raw dumps when diagnosing R11.
+
 ## Step 2: decode path (first milestone: correct greedy text)
 
 Only `src/metal.m` and `metal/dsm.metal`. This is one lane: wait for the
