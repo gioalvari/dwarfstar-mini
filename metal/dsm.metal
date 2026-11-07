@@ -1300,6 +1300,7 @@ kernel void route_topk(device const float *route [[buffer(0)]], device uint *ids
 kernel void NAME(device const uchar *w [[buffer(0)]], device const float *x [[buffer(1)]], device float *y [[buffer(2)]], constant ExpertGemv &p [[buffer(3)]], device const uint *ids [[buffer(4)]], ushort tid [[thread_index_in_threadgroup]], uint3 tgpig [[threadgroup_position_in_grid]], threadgroup float *sum [[threadgroup(0)]]) { \
     uint row=tgpig.x,slot=tgpig.z; float v=0; if(row<p.out) { device const uchar *r=w+uint64_t(ids[slot])*p.expert_stride+row*(p.in/256)*BYTES; device const float *input=x+slot*p.input_stride; for(uint j=tid;j<p.in;j+=256) v+=k_weight(r+(j/256)*BYTES,TYPE,j%256)*input[j]; } sum[tid]=v; threadgroup_barrier(mem_flags::mem_threadgroup); for(uint step=128;step;step>>=1){if(tid<step)sum[tid]+=sum[tid+step];threadgroup_barrier(mem_flags::mem_threadgroup);} if(!tid&&row<p.out)y[slot*p.out_stride+row]=sum[0]; \
 }
+EXPERT_K_GEMV(expert_q6k_gemv, 4, 210)
 kernel void expert_q8_0_gemv(
         device const block_q8_0 *w [[buffer(0)]], device const float *x [[buffer(1)]],
         device float *y [[buffer(2)]], constant ExpertGemv &p [[buffer(3)]],
