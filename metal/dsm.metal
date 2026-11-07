@@ -1067,14 +1067,14 @@ kernel void ssm_conv_step(device const float *input [[buffer(0)]],
                           constant SsmConv &p [[buffer(4)]],
                           uint channel [[thread_position_in_grid]]) {
     if (channel >= p.width) return;
-    device float *state = history + channel;
+    device float *state = history + channel * p.history;
     device const float *w = weights + channel * (p.history + 1);
-    float total = state[0] * w[0] + state[p.width] * w[1] +
-                  state[2 * p.width] * w[2] + input[channel] * w[3];
+    float total = state[0] * w[0] + state[1] * w[1] +
+                  state[2] * w[2] + input[channel] * w[3];
     output[channel] = total / (1.0f + exp(-total));
-    state[0] = state[p.width];
-    state[p.width] = state[2 * p.width];
-    state[2 * p.width] = input[channel];
+    state[0] = state[1];
+    state[1] = state[2];
+    state[2] = input[channel];
 }
 
 kernel void gdn_gates(device float *alpha [[buffer(0)]], device float *beta [[buffer(1)]],
@@ -1112,7 +1112,7 @@ kernel void gated_delta_net(device const float *q [[buffer(0)]], device const fl
     float delta = (v[head * p.state_dim + row] - sk) * beta[head];
     float y = 0.0f;
     for (uint column = lane; column < p.state_dim; column += 32) {
-        s[column] += kv[column] * delta;
+        s[column] += delta * kv[column];
         y += s[column] * qv[column];
     }
     y = simd_sum(y);
