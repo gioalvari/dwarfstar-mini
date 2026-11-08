@@ -222,13 +222,16 @@ static void encode_gemv_at(dsm_metal *s, id<MTLComputeCommandEncoder> e,
                            NSUInteger x_off, id<MTLBuffer> y,
                            NSUInteger y_off) {
     id<MTLBuffer> wb; uint64_t off; if (!tensor_view(s, w, &wb, &off)) return;
-    gemv_params p = {(uint32_t)w->dims[0], (uint32_t)w->dims[1]};
+    /* A 1-D weight (qwen35moe ffn_gate_inp_shexp [dim]) is a one-row matrix;
+       the GGUF loader leaves dims[1] = 0 for it. */
+    uint64_t rows = w->ndim > 1 ? w->dims[1] : 1;
+    gemv_params p = {(uint32_t)w->dims[0], (uint32_t)rows};
     gemv_mul_mv_params mul_mv = {
-        .ne00 = (int32_t)w->dims[0], .ne01 = (int32_t)w->dims[1], .ne02 = 1,
-        .nb00 = 0, .nb01 = w->bytes / w->dims[1], .nb02 = 0, .nb03 = 0,
+        .ne00 = (int32_t)w->dims[0], .ne01 = (int32_t)rows, .ne02 = 1,
+        .nb00 = 0, .nb01 = w->bytes / rows, .nb02 = 0, .nb03 = 0,
         .ne10 = (int32_t)w->dims[0], .ne11 = 1, .ne12 = 1,
         .nb10 = sizeof(float), .nb11 = 0, .nb12 = 0, .nb13 = 0,
-        .ne0 = (int32_t)w->dims[1], .ne1 = 1, .nr0 = 0, .r2 = 1, .r3 = 1,
+        .ne0 = (int32_t)rows, .ne1 = 1, .nr0 = 0, .r2 = 1, .r3 = 1,
     };
     id<MTLComputePipelineState> state = s->f32;
     switch (w->type) {
