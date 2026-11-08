@@ -33,6 +33,7 @@ static int json_is(const dsm_json *value, const char *text) {
     return value && value->type == DSM_JSON_STRING && value->len == strlen(text) &&
            !memcmp(value->text, text, value->len);
 }
+/* The shipped Qwen3.5 template trims message content before rendering it. */
 static int append_trimmed_content(string *out, const dsm_json *content, int strip_thinking) {
     if (!content || content->type != DSM_JSON_STRING) return 0;
     char *owned = dsm_json_string_dup(content);

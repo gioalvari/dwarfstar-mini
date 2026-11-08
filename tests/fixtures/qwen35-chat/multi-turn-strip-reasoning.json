@@ -1,0 +1,1 @@
+{"messages":[{"role":"user","content":"Question"},{"role":"assistant","content":"<think>\nsecret\n</think>\n\nAnswer"},{"role":"user","content":"Again"}]}
