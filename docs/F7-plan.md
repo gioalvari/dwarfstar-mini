@@ -260,6 +260,29 @@ flash-decoding fixer to land first.
   - `./dsm --chat` answers coherently.
 - Size: L, ~600 LOC across metal+m.
 
+**Result 2a-2c (2026-11-08, `ee006bc`).** The first attempt failed because the
+1-D `ffn_gate_inp_shexp` weight had `dims[1] = 0`. The F32 GEMV then dispatched
+zero rows, so the shared-expert gate stayed σ(0) = 0.5 (fixed in `ee006bc`).
+After the fix:
+- 5-token prompts (`The capital of France is`, `def fibonacci(n):`): `l_out`
+  rel L2 ≤ 2.7e-5 on all 40 layers × 5 positions; KL median 4.4e-11 and
+  7.6e-11; top-1 5/5; 32-token greedy identical to `llama-ref --greedy 32`;
+  two runs identical.
+- 570-token P, all positions:
+
+  | comparison | KL median | KL max | top-1 | top-5 |
+  |---|---:|---:|---:|---:|
+  | DSM vs llama Metal | 6.3e-5 | 8.2 | 98.4% | 88.4% |
+  | DSM vs llama CPU | 1.08e-4 | 17.5 | 98.1% | 85.2% |
+  | llama Metal vs llama CPU (floor) | 1.19e-4 | 17.0 | 98.9% | 85.5% |
+
+  DSM is as far from the CPU reference as llama's own Metal backend is (R11),
+  so the max-KL gate does not apply to qwen35moe. Use median KL plus greedy
+  output instead. The 64-token greedy continuation of P is identical to
+  `llama-ref`.
+- Speed (token loop, no batched prefill yet): prefill 41 tok/s, decode
+  39-43 tok/s.
+
 **2d. Session / rewind** (`src/metal.h`, `src/metal.m`, `src/server.c`, `tools/prefill_check.c`). Size: M.
 - API change: `uint32_t dsm_metal_rewind(dsm_metal*, uint32_t pos)` returns the
   position actually restored, ≤ pos. For non-hybrid models it equals pos (same
@@ -307,8 +330,9 @@ flash-decoding fixer to land first.
 
 ## Step 4: performance (only after Steps 0-3 are green)
 
-- Baseline. **TODO**: the file was incomplete during planning and another DSM
-  GPU job was running, so nothing was measured.
+- Baseline (2026-11-08, llama.cpp build 9860 `fdb1db877`, GPU idle): pp512
+  754.38 ± 2.12 tok/s, tg128 52.06 ± 0.41 tok/s. Targets: decode ≥ 31 tok/s
+  (already met by the token path at 39-43), prefill ≥ 302 tok/s.
   - Command: `llama-bench -m models/Qwen3.6-35B-A3B-UD-Q4_K_S.gguf -p 512 -n 128 -fa 1 -r 3`, warm.
   - DSM: `bench-prefill` warm (F6 lesson: measure the 2nd run) and
     `./dsm -n 128 --temp 0`.
