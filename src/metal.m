@@ -65,6 +65,11 @@ typedef struct {
     uint64_t weight_bytes[PROFILE_CATEGORY_COUNT];
     double gpu_seconds[PROFILE_CATEGORY_COUNT], cpu_encode_seconds;
 } dsm_metal_profile;
+typedef struct {
+    id<MTLBuffer> conv_state, ssm_state;
+    uint32_t pos;
+    int valid;
+} recurrent_checkpoint;
 struct dsm_metal {
     const dsm_model *m; uint32_t pos, context, n_views;
     id<MTLDevice> device; id<MTLCommandQueue> queue; id<MTLResidencySet> residency;
@@ -77,6 +82,8 @@ struct dsm_metal {
     id<MTLBuffer> qg, qkv_mixed, conv_out, z, alpha, beta, conv_state, ssm_state, shared_gate;
     id<MTLBuffer> bx, bnorm, bq, bk, bv, batt, btmp, bgate, bup, broute, bids, bw, mm_id_tpe, mm_id_hids;
     uint32_t batch_chunk;
+    recurrent_checkpoint *checkpoints;
+    uint32_t checkpoint_count, checkpoint_next;
     dsm_metal_profile profile;
 };
 
@@ -120,6 +127,30 @@ static int attention_decode_enabled(void) {
 }
 static int qwen35_arch(const dsm_model *m) {
     return m->arch == DSM_ARCH_QWEN35 || m->arch == DSM_ARCH_QWEN35MOE;
+}
+static uint32_t checkpoint_ring_size(void) {
+    const char *value = getenv("DSM_CKPT");
+    char *end = NULL;
+    unsigned long count = value ? strtoul(value, &end, 10) : 3;
+    if (!value || !*value || *end || count < 2 || count > 4) count = 3;
+    return (uint32_t)count;
+}
+static int checkpoint_buffers(dsm_metal *s) {
+    if (!qwen35_arch(s->m) || s->checkpoints) return 1;
+    s->checkpoint_count = checkpoint_ring_size();
+    s->checkpoints = calloc(s->checkpoint_count, sizeof(*s->checkpoints));
+    if (!s->checkpoints) return 0;
+    for (uint32_t i = 0; i < s->checkpoint_count; ++i) {
+        s->checkpoints[i].conv_state = buffer(s->device, s->conv_state.length);
+        s->checkpoints[i].ssm_state = buffer(s->device, s->ssm_state.length);
+        if (!s->checkpoints[i].conv_state || !s->checkpoints[i].ssm_state) return 0;
+    }
+    return 1;
+}
+static void invalidate_checkpoints_after(dsm_metal *s, uint32_t pos) {
+    for (uint32_t i = 0; i < s->checkpoint_count; ++i)
+        if (s->checkpoints[i].valid && s->checkpoints[i].pos > pos)
+            s->checkpoints[i].valid = 0;
 }
 static void dump_hybrid_layer(const dsm_metal *s, uint32_t layer) {
     const char *dir = getenv("DSM_DUMP_DIR");
@@ -450,9 +481,53 @@ int dsm_metal_init(dsm_metal **out,const dsm_model *m,uint32_t context,char *err
     uint32_t ffn=m->is_moe?m->expert_hidden:m->hidden, slots=m->is_moe?m->experts_used:1;uint64_t kv=(uint64_t)(qwen35_arch(m) ? m->n_attn_layers : m->layers)*context*m->kv_heads*m->key_dim*4;s->x=buffer(s->device,m->dim*4);s->norm_x=buffer(s->device,m->dim*4);s->q=buffer(s->device,m->q_width*4);s->k=buffer(s->device,(qwen35_arch(m) ? (m->ssm_groups*m->ssm_state > m->kv_heads*m->key_dim ? m->ssm_groups*m->ssm_state : m->kv_heads*m->key_dim) : m->kv_heads*m->key_dim)*4);s->v=buffer(s->device,m->kv_heads*m->value_dim*4);s->att=buffer(s->device,m->attn_width*4);s->tmp=buffer(s->device,m->dim*slots*4);s->gate=buffer(s->device,ffn*slots*4);s->up=buffer(s->device,ffn*slots*4);s->route=m->is_moe?buffer(s->device,m->experts*4):NULL;s->expert_ids=m->is_moe?buffer(s->device,m->experts_used*4):NULL;s->expert_weights=m->is_moe?buffer(s->device,m->experts_used*4):NULL;s->scores=buffer(s->device,(uint64_t)context*m->heads*4);s->keys=buffer(s->device,kv);s->values=buffer(s->device,kv);s->logits=buffer(s->device,m->vocab*4);s->attention_partial=buffer(s->device,(uint64_t)m->heads*((context+63)/64)*(m->key_dim+2)*sizeof(float));s->qg=qwen35_arch(m)?buffer(s->device,(uint64_t)m->q_width*2*4):NULL;s->qkv_mixed=qwen35_arch(m)?buffer(s->device,m->ssm_inner+m->ssm_groups*m->ssm_state*2*4):NULL;s->conv_out=qwen35_arch(m)?buffer(s->device,m->ssm_inner+m->ssm_groups*m->ssm_state*2*4):NULL;s->z=qwen35_arch(m)?buffer(s->device,m->ssm_inner*4):NULL;s->alpha=qwen35_arch(m)?buffer(s->device,m->ssm_vheads*4):NULL;s->beta=qwen35_arch(m)?buffer(s->device,m->ssm_vheads*4):NULL;s->conv_state=qwen35_arch(m)?buffer(s->device,(uint64_t)m->layers*(m->ssm_inner+2*m->ssm_groups*m->ssm_state)*(m->ssm_conv-1)*4):NULL;s->ssm_state=qwen35_arch(m)?buffer(s->device,(uint64_t)m->layers*m->ssm_vheads*m->ssm_state*m->ssm_state*4):NULL;s->shared_gate=qwen35_arch(m)?buffer(s->device,4):NULL;s->batch_chunk=prefill_chunk_size(m);s->bx=buffer(s->device,(uint64_t)s->batch_chunk*m->dim*4);s->bnorm=buffer(s->device,(uint64_t)s->batch_chunk*m->dim*4);s->bq=buffer(s->device,(uint64_t)s->batch_chunk*m->q_width*4);s->bk=buffer(s->device,(uint64_t)s->batch_chunk*m->kv_heads*m->key_dim*4);s->bv=buffer(s->device,(uint64_t)s->batch_chunk*m->kv_heads*m->value_dim*4);s->batt=buffer(s->device,(uint64_t)s->batch_chunk*m->attn_width*4);s->btmp=buffer(s->device,(uint64_t)s->batch_chunk*m->dim*slots*4);s->bgate=buffer(s->device,(uint64_t)s->batch_chunk*ffn*slots*4);s->bup=buffer(s->device,(uint64_t)s->batch_chunk*ffn*slots*4);s->broute=m->is_moe?buffer(s->device,(uint64_t)s->batch_chunk*m->experts*4):NULL;s->bids=m->is_moe?buffer(s->device,(uint64_t)s->batch_chunk*m->experts_used*4):NULL;s->bw=m->is_moe?buffer(s->device,(uint64_t)s->batch_chunk*m->experts_used*4):NULL;uint32_t max_tiles=m->is_moe?matmul_id_max_tiles(m->experts,m->experts_used,s->batch_chunk):0;s->mm_id_tpe=m->is_moe?buffer(s->device,(uint64_t)(1+3*max_tiles)*sizeof(uint32_t)):NULL;s->mm_id_hids=m->is_moe?buffer(s->device,(uint64_t)(m->experts_used*s->batch_chunk+m->experts)*sizeof(int32_t)):NULL;if(!s->x||!s->norm_x||!s->q||!s->k||!s->v||!s->att||!s->tmp||!s->gate||!s->up||(m->is_moe&&(!s->route||!s->expert_ids||!s->expert_weights))||!s->scores||!s->keys||!s->values||!s->logits||!s->attention_partial||(qwen35_arch(m)&&(!s->qg||!s->qkv_mixed||!s->conv_out||!s->z||!s->alpha||!s->beta||!s->conv_state||!s->ssm_state||!s->shared_gate))||!s->bx||!s->bnorm||!s->bq||!s->bk||!s->bv||!s->batt||!s->btmp||!s->bgate||!s->bup||(m->is_moe&&(!s->broute||!s->bids||!s->bw||!s->mm_id_tpe||!s->mm_id_hids))){set_error(error,error_size,"cannot allocate Metal activations");goto bad;}*out=s;return 1;
 bad:dsm_metal_free(s);return 0;
 }
-void dsm_metal_free(dsm_metal *s){if(!s)return;if(s->profile.enabled)dsm_metal_profile_print(s);free(s->views);free(s);}
+void dsm_metal_free(dsm_metal *s){if(!s)return;if(s->profile.enabled)dsm_metal_profile_print(s);free(s->checkpoints);free(s->views);free(s);}
 uint32_t dsm_metal_pos(const dsm_metal *s){return s->pos;}
-int dsm_metal_truncate(dsm_metal *s,uint32_t pos){if(!s||pos>s->pos)return 0;if(qwen35_arch(s->m)&&pos!=0)return 0;if(qwen35_arch(s->m)){memset(s->conv_state.contents,0,s->conv_state.length);memset(s->ssm_state.contents,0,s->ssm_state.length);}s->pos=pos;return 1;}
+int dsm_metal_checkpoint(dsm_metal *s) {
+    if (!s || !qwen35_arch(s->m)) return s != NULL;
+    if (!checkpoint_buffers(s)) return 0;
+    recurrent_checkpoint *checkpoint = &s->checkpoints[s->checkpoint_next];
+    id<MTLCommandBuffer> cb = [s->queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit copyFromBuffer:s->conv_state sourceOffset:0 toBuffer:checkpoint->conv_state
+      destinationOffset:0 size:s->conv_state.length];
+    [blit copyFromBuffer:s->ssm_state sourceOffset:0 toBuffer:checkpoint->ssm_state
+      destinationOffset:0 size:s->ssm_state.length];
+    [blit endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if (cb.status != MTLCommandBufferStatusCompleted) return 0;
+    checkpoint->pos = s->pos;
+    checkpoint->valid = 1;
+    s->checkpoint_next = (s->checkpoint_next + 1) % s->checkpoint_count;
+    return 1;
+}
+uint32_t dsm_metal_rewind(dsm_metal *s, uint32_t pos) {
+    if (!s || pos > s->pos) return UINT32_MAX;
+    if (!qwen35_arch(s->m)) { s->pos = pos; return pos; }
+    recurrent_checkpoint *best = NULL;
+    for (uint32_t i = 0; i < s->checkpoint_count; ++i) {
+        recurrent_checkpoint *checkpoint = &s->checkpoints[i];
+        if (checkpoint->valid && checkpoint->pos <= pos &&
+            (!best || checkpoint->pos > best->pos)) best = checkpoint;
+    }
+    if (!best) {
+        memset(s->conv_state.contents, 0, s->conv_state.length);
+        memset(s->ssm_state.contents, 0, s->ssm_state.length);
+        s->pos = 0;
+    } else {
+        id<MTLCommandBuffer> cb = [s->queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit copyFromBuffer:best->conv_state sourceOffset:0 toBuffer:s->conv_state
+          destinationOffset:0 size:s->conv_state.length];
+        [blit copyFromBuffer:best->ssm_state sourceOffset:0 toBuffer:s->ssm_state
+          destinationOffset:0 size:s->ssm_state.length];
+        [blit endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) return UINT32_MAX;
+        s->pos = best->pos;
+    }
+    invalidate_checkpoints_after(s, s->pos);
+    return s->pos;
+}
+int dsm_metal_truncate(dsm_metal *s,uint32_t pos){return s&&dsm_metal_rewind(s,pos)==pos;}
 int dsm_metal_matvec_test(dsm_metal *s,const gguf_tensor *w,const float *input,float *output){if(!s||!w||!dsm_quant_supported(w->type))return 0;id<MTLBuffer> x=buffer(s->device,w->dims[0]*sizeof(float)),y=buffer(s->device,w->dims[1]*sizeof(float));if(!x||!y)return 0;memcpy(x.contents,input,w->dims[0]*sizeof(float));id<MTLCommandBuffer> cb=[s->queue commandBuffer];id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];encode_gemv(s,e,w,x,y);[e endEncoding];[cb commit];[cb waitUntilCompleted];if(cb.status!=MTLCommandBufferStatusCompleted)return 0;memcpy(output,y.contents,w->dims[1]*sizeof(float));return 1;}
 int dsm_metal_matmul_test(dsm_metal *s, const gguf_tensor *w, const float *input,
                           uint32_t rows, float *output) {

@@ -15,6 +15,10 @@ int dsm_metal_token(dsm_metal *state, int32_t token, float *logits);
 int dsm_metal_prefill(dsm_metal *state, const int32_t *tokens, uint32_t n,
                       float *logits);
 uint32_t dsm_metal_pos(const dsm_metal *state);
+/* Returns the checkpoint position restored at or before pos, or UINT32_MAX. */
+uint32_t dsm_metal_rewind(dsm_metal *state, uint32_t pos);
+/* Saves the current hybrid recurrent state after all preceding Metal work. */
+int dsm_metal_checkpoint(dsm_metal *state);
 int dsm_metal_truncate(dsm_metal *state, uint32_t pos);
 int dsm_metal_matvec_test(dsm_metal *state, const gguf_tensor *weights,
                            const float *input, float *output);
