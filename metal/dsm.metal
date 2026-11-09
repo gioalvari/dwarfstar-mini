@@ -356,6 +356,17 @@ kernel void f32_gemv_rows(device const float *w [[buffer(0)]],
     if (!tid) y[row * p.y_stride + out] = sum[0];
 }
 
+kernel void shexp_add_batch(device float *x [[buffer(0)]],
+                            device const float *shared [[buffer(1)]],
+                            device const float *gate [[buffer(2)]],
+                            constant uint &width [[buffer(3)]],
+                            constant uint &n [[buffer(4)]],
+                            uint index [[thread_position_in_grid]]) {
+    if (index >= n) return;
+    x[index] += shared[index] /
+                (1.0f + exp(-gate[index / width]));
+}
+
 inline float k_f16(device const uchar *p) { return float(as_type<half>(*reinterpret_cast<const device ushort *>(p))); }
 inline uchar k4_scale(device const uchar *s, uint index, bool minv) {
     if (index < 4) return s[index + (minv ? 4 : 0)] & 63;

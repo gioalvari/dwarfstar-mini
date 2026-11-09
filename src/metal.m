@@ -78,7 +78,7 @@ struct dsm_metal {
     const dsm_model *m; uint32_t pos, context, n_views;
     id<MTLDevice> device; id<MTLCommandQueue> queue; id<MTLResidencySet> residency;
     id<MTLComputePipelineState> q8, q2k, q3k, q4k, q5k, q6k, f32, norm, rope, rope_partial, cache, attention, attention_split, attention_merge, add, swiglu, route_topk, expert_q8, expert_q8_fast, expert_q3k, expert_q4k, expert_q6k, expert_swiglu, moe_add;
-    id<MTLComputePipelineState> split_q_gate, split_gdn_qk, l2norm, ssm_conv, gdn_gates, gdn, gated_rmsnorm, sigmoid_mul, shexp_add;
+    id<MTLComputePipelineState> split_q_gate, split_gdn_qk, l2norm, ssm_conv, gdn_gates, gdn, gated_rmsnorm, sigmoid_mul, shexp_add, f32_rows, shexp_add_batch;
     id<MTLComputePipelineState> ssm_conv_batch, split_gdn_qk_batch, gdn_gates_batch, gdn_batch;
     id<MTLComputePipelineState> rope_batch, cache_batch, attention_prefill, moe_add_batch;
     id<MTLComputePipelineState> mm_q8, mm_q2k, mm_q3k, mm_q4k, mm_q6k, mm_id_map0, mm_id_q8, mm_id_q2k, mm_id_q3k, mm_id_q4k, mm_id_q6k;
@@ -86,6 +86,7 @@ struct dsm_metal {
     id<MTLBuffer> x, norm_x, q, k, v, att, tmp, gate, up, route, expert_ids, expert_weights, scores, keys, values, logits, attention_partial;
     id<MTLBuffer> qg, qkv_mixed, conv_out, z, alpha, beta, conv_state, ssm_state, shared_gate;
     id<MTLBuffer> bx, bnorm, bq, bk, bv, batt, btmp, bgate, bup, broute, bids, bw, mm_id_tpe, mm_id_hids;
+    id<MTLBuffer> hb_qkv, hb_conv, hb_dq, hb_dk, hb_z, hb_g, hb_beta, hb_mix, hb_qg, hb_aq, hb_agate, hb_ak, hb_av, hb_out, hb_shg, hb_sgate, hb_sup, hb_sdown;
     uint32_t batch_chunk;
     recurrent_checkpoint *checkpoints;
     uint32_t checkpoint_count, checkpoint_next;
@@ -131,6 +132,10 @@ static uint32_t prefill_chunk_size(const dsm_model *m) {
 static int prefill_enabled(void) {
     const char *value = getenv("DSM_PREFILL");
     return !value || strcmp(value, "0");
+}
+static int hybrid_prefill_enabled(void) {
+    const char *value = getenv("DSM_HYBRID_PREFILL");
+    return value && !strcmp(value, "1");
 }
 static int mul_mm_id_enabled(void) {
     const char *value = getenv("DSM_MUL_MM_ID");
@@ -309,6 +314,25 @@ static void encode_gemv_at(dsm_metal *s, id<MTLComputeCommandEncoder> e,
         [e setBytes:&p length:sizeof(p) atIndex:3];
         [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0]; [e dispatchThreadgroups:MTLSizeMake(p.out, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
+}
+static void encode_f32_rows(dsm_metal *s, id<MTLComputeCommandEncoder> e,
+                            const gguf_tensor *w, id<MTLBuffer> x,
+                            id<MTLBuffer> y, uint32_t rows,
+                            uint32_t x_stride, uint32_t y_stride) {
+    id<MTLBuffer> wb;
+    uint64_t off;
+    if (!tensor_view(s, w, &wb, &off)) return;
+    gemv_rows_params p = {(uint32_t)w->dims[0],
+                          (uint32_t)(w->ndim > 1 ? w->dims[1] : 1), rows,
+                          x_stride, y_stride};
+    [e setComputePipelineState:s->f32_rows];
+    set_checked(e, wb, (NSUInteger)off, (NSUInteger)w->bytes, 0);
+    set_checked(e, x, 0, (NSUInteger)rows * x_stride * sizeof(float), 1);
+    set_checked(e, y, 0, (NSUInteger)rows * y_stride * sizeof(float), 2);
+    [e setBytes:&p length:sizeof(p) atIndex:3];
+    [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
+    [e dispatchThreadgroups:MTLSizeMake(p.out, rows, 1)
+  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
 static void encode_gemv(dsm_metal *s, id<MTLComputeCommandEncoder> e,
                          const gguf_tensor *w, id<MTLBuffer> x,
@@ -492,8 +516,44 @@ int dsm_metal_init(dsm_metal **out,const dsm_model *m,uint32_t context,char *err
     }
     s->q8=pipeline(s->device,lib,@"q8_gemv",error,error_size);s->q2k=pipeline(s->device,lib,@"q2k_gemv",error,error_size);s->q3k=pipeline(s->device,lib,@"q3k_gemv",error,error_size);s->q4k=pipeline(s->device,lib,@"q4k_gemv",error,error_size);s->q5k=pipeline(s->device,lib,@"q5k_gemv",error,error_size);s->q6k=pipeline(s->device,lib,@"q6k_gemv",error,error_size);s->f32=pipeline(s->device,lib,@"f32_gemv",error,error_size);s->norm=pipeline(s->device,lib,@"rmsnorm",error,error_size);s->rope=pipeline(s->device,lib,@"rope_neox",error,error_size);s->rope_partial=pipeline(s->device,lib,@"rope_neox_partial",error,error_size);s->split_q_gate=pipeline(s->device,lib,@"split_q_gate",error,error_size);s->split_gdn_qk=pipeline(s->device,lib,@"split_gdn_qk",error,error_size);s->l2norm=pipeline(s->device,lib,@"l2norm_heads",error,error_size);s->ssm_conv=pipeline(s->device,lib,@"ssm_conv_step",error,error_size);s->gdn_gates=pipeline(s->device,lib,@"gdn_gates",error,error_size);s->gdn=pipeline(s->device,lib,@"gated_delta_net",error,error_size);s->gated_rmsnorm=pipeline(s->device,lib,@"gated_rmsnorm_silu",error,error_size);s->sigmoid_mul=pipeline(s->device,lib,@"sigmoid_mul",error,error_size);s->shexp_add=pipeline(s->device,lib,@"shexp_add",error,error_size);s->ssm_conv_batch=pipeline(s->device,lib,@"ssm_conv_batch",error,error_size);s->split_gdn_qk_batch=pipeline(s->device,lib,@"split_gdn_qk_batch",error,error_size);s->gdn_gates_batch=pipeline(s->device,lib,@"gdn_gates_batch",error,error_size);s->gdn_batch=pipeline(s->device,lib,@"gated_delta_net_batch",error,error_size);s->cache=pipeline(s->device,lib,@"cache_write",error,error_size);s->attention=pipeline(s->device,lib,@"attention_decode",error,error_size);s->attention_split=pipeline(s->device,lib,@"attention_decode_split",error,error_size);s->attention_merge=pipeline(s->device,lib,@"attention_decode_merge",error,error_size);s->add=pipeline(s->device,lib,@"add_inplace",error,error_size);s->swiglu=pipeline(s->device,lib,@"swiglu",error,error_size);s->route_topk=pipeline(s->device,lib,@"route_topk",error,error_size);s->expert_q8=pipeline(s->device,lib,@"expert_q8_0_gemv",error,error_size);s->expert_q8_fast=pipeline(s->device,lib,@"expert_q8_0_gemv_fast",error,error_size);s->expert_q3k=pipeline(s->device,lib,@"expert_q3k_gemv",error,error_size);s->expert_q4k=pipeline(s->device,lib,@"expert_q4k_gemv",error,error_size);s->expert_q6k=pipeline(s->device,lib,@"expert_q6k_gemv",error,error_size);s->expert_swiglu=pipeline(s->device,lib,@"expert_swiglu",error,error_size);s->moe_add=pipeline(s->device,lib,@"moe_add",error,error_size);if(!s->q8||!s->q2k||!s->q3k||!s->q4k||!s->q5k||!s->q6k||!s->f32||!s->norm||!s->rope||!s->rope_partial||!s->split_q_gate||!s->split_gdn_qk||!s->l2norm||!s->ssm_conv||!s->gdn_gates||!s->gdn||!s->gated_rmsnorm||!s->sigmoid_mul||!s->shexp_add||!s->ssm_conv_batch||!s->split_gdn_qk_batch||!s->gdn_gates_batch||!s->gdn_batch||!s->cache||!s->attention||!s->attention_split||!s->attention_merge||!s->add||!s->swiglu||!s->route_topk||!s->expert_q8||!s->expert_q8_fast||!s->expert_q3k||!s->expert_q4k||!s->expert_q6k||!s->expert_swiglu||!s->moe_add)goto bad;
     s->rope_batch=pipeline(s->device,lib,@"rope_neox_batch",error,error_size);s->cache_batch=pipeline(s->device,lib,@"cache_write_batch",error,error_size);s->attention_prefill=pipeline(s->device,lib,@"attention_prefill",error,error_size);s->moe_add_batch=pipeline(s->device,lib,@"moe_add_batch",error,error_size);s->mm_q8=pipeline(s->device,lib,@"mul_mm_q8_0",error,error_size);s->mm_q2k=pipeline(s->device,lib,@"mul_mm_q2_K",error,error_size);s->mm_q3k=pipeline(s->device,lib,@"mul_mm_q3_K",error,error_size);s->mm_q4k=pipeline(s->device,lib,@"mul_mm_q4_K",error,error_size);s->mm_q6k=pipeline(s->device,lib,@"mul_mm_q6_K",error,error_size);s->mm_id_map0=pipeline(s->device,lib,@"mul_mm_id_map0",error,error_size);s->mm_id_q8=pipeline(s->device,lib,@"mul_mm_id_q8_0",error,error_size);s->mm_id_q2k=pipeline(s->device,lib,@"mul_mm_id_q2_K",error,error_size);s->mm_id_q3k=pipeline(s->device,lib,@"mul_mm_id_q3_K",error,error_size);s->mm_id_q4k=pipeline(s->device,lib,@"mul_mm_id_q4_K",error,error_size);s->mm_id_q6k=pipeline(s->device,lib,@"mul_mm_id_q6_K",error,error_size);if(!s->rope_batch||!s->cache_batch||!s->attention_prefill||!s->moe_add_batch||!s->mm_q8||!s->mm_q2k||!s->mm_q3k||!s->mm_q4k||!s->mm_q6k||!s->mm_id_map0||!s->mm_id_q8||!s->mm_id_q2k||!s->mm_id_q3k||!s->mm_id_q4k||!s->mm_id_q6k)goto bad;
+    s->f32_rows = pipeline(s->device, lib, @"f32_gemv_rows", error, error_size);
+    s->shexp_add_batch = pipeline(s->device, lib, @"shexp_add_batch", error,
+                                  error_size);
+    if (!s->f32_rows || !s->shexp_add_batch) goto bad;
     const uint64_t page=(uint64_t)getpagesize(), start=m->gguf.tensor_data_offset&~(page-1), end=m->gguf.size, max=[s->device maxBufferLength]&~(page-1);if(!max){set_error(error,error_size,"Metal max buffer length is zero");goto bad;}uint64_t max_tensor=0;for(uint64_t i=0;i<m->gguf.n_tensors;++i)if(m->gguf.tensors[i].bytes>max_tensor)max_tensor=m->gguf.tensors[i].bytes;uint64_t overlap=((max_tensor+page-1)&~(page-1))+page,step=end-start<=max?max:max-overlap;if(overlap>=max){set_error(error,error_size,"tensor larger than Metal max buffer length");goto bad;}s->n_views=end-start<=max?1:(uint32_t)((end-start-overlap+step-1)/step);s->views=calloc(s->n_views,sizeof(*s->views));if(!s->views){set_error(error,error_size,"out of memory");goto bad;}for(uint32_t i=0;i<s->n_views;++i){uint64_t off=start+(uint64_t)i*step,bytes=end-off<max?end-off:max;bytes=(bytes+page-1)&~(page-1);s->views[i].buffer=[s->device newBufferWithBytesNoCopy:(void *)(m->gguf.map+off) length:(NSUInteger)bytes options:MTLResourceStorageModeShared deallocator:nil];s->views[i].file_offset=off;s->views[i].bytes=bytes;if(!s->views[i].buffer){set_error(error,error_size,"cannot wrap GGUF mmap in Metal buffer");goto bad;}}for(uint64_t i=0;i<m->gguf.n_tensors;++i){id<MTLBuffer> wb;uint64_t off;if(!tensor_view(s,&m->gguf.tensors[i],&wb,&off)){set_error(error,error_size,"GGUF tensor not mappable to Metal view");goto bad;}}if(@available(macOS 15.0,*)){MTLResidencySetDescriptor *descriptor=[MTLResidencySetDescriptor new];descriptor.initialCapacity=s->n_views;s->residency=[s->device newResidencySetWithDescriptor:descriptor error:&ns_error];if(s->residency){for(uint32_t i=0;i<s->n_views;++i)[s->residency addAllocation:s->views[i].buffer];[s->residency commit];[s->residency requestResidency];[s->queue addResidencySet:s->residency];}}
-    uint32_t ffn=m->is_moe?m->expert_hidden:m->hidden, slots=m->is_moe?m->experts_used:1;uint64_t kv=(uint64_t)(qwen35_arch(m) ? m->n_attn_layers : m->layers)*context*m->kv_heads*m->key_dim*4;s->x=buffer(s->device,m->dim*4);s->norm_x=buffer(s->device,m->dim*4);s->q=buffer(s->device,m->q_width*4);s->k=buffer(s->device,(qwen35_arch(m) ? (m->ssm_groups*m->ssm_state > m->kv_heads*m->key_dim ? m->ssm_groups*m->ssm_state : m->kv_heads*m->key_dim) : m->kv_heads*m->key_dim)*4);s->v=buffer(s->device,m->kv_heads*m->value_dim*4);s->att=buffer(s->device,m->attn_width*4);s->tmp=buffer(s->device,m->dim*slots*4);s->gate=buffer(s->device,ffn*slots*4);s->up=buffer(s->device,ffn*slots*4);s->route=m->is_moe?buffer(s->device,m->experts*4):NULL;s->expert_ids=m->is_moe?buffer(s->device,m->experts_used*4):NULL;s->expert_weights=m->is_moe?buffer(s->device,m->experts_used*4):NULL;s->scores=buffer(s->device,(uint64_t)context*m->heads*4);s->keys=buffer(s->device,kv);s->values=buffer(s->device,kv);s->logits=buffer(s->device,m->vocab*4);s->attention_partial=buffer(s->device,(uint64_t)m->heads*((context+63)/64)*(m->key_dim+2)*sizeof(float));s->qg=qwen35_arch(m)?buffer(s->device,(uint64_t)m->q_width*2*4):NULL;s->qkv_mixed=qwen35_arch(m)?buffer(s->device,(m->ssm_inner+2*m->ssm_groups*m->ssm_state)*sizeof(float)):NULL;s->conv_out=qwen35_arch(m)?buffer(s->device,(m->ssm_inner+2*m->ssm_groups*m->ssm_state)*sizeof(float)):NULL;s->z=qwen35_arch(m)?buffer(s->device,m->ssm_inner*4):NULL;s->alpha=qwen35_arch(m)?buffer(s->device,m->ssm_vheads*4):NULL;s->beta=qwen35_arch(m)?buffer(s->device,m->ssm_vheads*4):NULL;s->conv_state=qwen35_arch(m)?buffer(s->device,(uint64_t)m->layers*(m->ssm_inner+2*m->ssm_groups*m->ssm_state)*(m->ssm_conv-1)*4):NULL;s->ssm_state=qwen35_arch(m)?buffer(s->device,(uint64_t)m->layers*m->ssm_vheads*m->ssm_state*m->ssm_state*4):NULL;s->shared_gate=qwen35_arch(m)?buffer(s->device,4):NULL;s->batch_chunk=prefill_chunk_size(m);s->bx=buffer(s->device,(uint64_t)s->batch_chunk*m->dim*4);s->bnorm=buffer(s->device,(uint64_t)s->batch_chunk*m->dim*4);s->bq=buffer(s->device,(uint64_t)s->batch_chunk*m->q_width*4);s->bk=buffer(s->device,(uint64_t)s->batch_chunk*m->kv_heads*m->key_dim*4);s->bv=buffer(s->device,(uint64_t)s->batch_chunk*m->kv_heads*m->value_dim*4);s->batt=buffer(s->device,(uint64_t)s->batch_chunk*m->attn_width*4);s->btmp=buffer(s->device,(uint64_t)s->batch_chunk*m->dim*slots*4);s->bgate=buffer(s->device,(uint64_t)s->batch_chunk*ffn*slots*4);s->bup=buffer(s->device,(uint64_t)s->batch_chunk*ffn*slots*4);s->broute=m->is_moe?buffer(s->device,(uint64_t)s->batch_chunk*m->experts*4):NULL;s->bids=m->is_moe?buffer(s->device,(uint64_t)s->batch_chunk*m->experts_used*4):NULL;s->bw=m->is_moe?buffer(s->device,(uint64_t)s->batch_chunk*m->experts_used*4):NULL;uint32_t max_tiles=m->is_moe?matmul_id_max_tiles(m->experts,m->experts_used,s->batch_chunk):0;s->mm_id_tpe=m->is_moe?buffer(s->device,(uint64_t)(1+3*max_tiles)*sizeof(uint32_t)):NULL;s->mm_id_hids=m->is_moe?buffer(s->device,(uint64_t)(m->experts_used*s->batch_chunk+m->experts)*sizeof(int32_t)):NULL;if(!s->x||!s->norm_x||!s->q||!s->k||!s->v||!s->att||!s->tmp||!s->gate||!s->up||(m->is_moe&&(!s->route||!s->expert_ids||!s->expert_weights))||!s->scores||!s->keys||!s->values||!s->logits||!s->attention_partial||(qwen35_arch(m)&&(!s->qg||!s->qkv_mixed||!s->conv_out||!s->z||!s->alpha||!s->beta||!s->conv_state||!s->ssm_state||!s->shared_gate))||!s->bx||!s->bnorm||!s->bq||!s->bk||!s->bv||!s->batt||!s->btmp||!s->bgate||!s->bup||(m->is_moe&&(!s->broute||!s->bids||!s->bw||!s->mm_id_tpe||!s->mm_id_hids))){set_error(error,error_size,"cannot allocate Metal activations");goto bad;}*out=s;return 1;
+    uint32_t ffn=m->is_moe?m->expert_hidden:m->hidden, slots=m->is_moe?m->experts_used:1;uint64_t kv=(uint64_t)(qwen35_arch(m) ? m->n_attn_layers : m->layers)*context*m->kv_heads*m->key_dim*4;s->x=buffer(s->device,m->dim*4);s->norm_x=buffer(s->device,m->dim*4);s->q=buffer(s->device,m->q_width*4);s->k=buffer(s->device,(qwen35_arch(m) ? (m->ssm_groups*m->ssm_state > m->kv_heads*m->key_dim ? m->ssm_groups*m->ssm_state : m->kv_heads*m->key_dim) : m->kv_heads*m->key_dim)*4);s->v=buffer(s->device,m->kv_heads*m->value_dim*4);s->att=buffer(s->device,m->attn_width*4);s->tmp=buffer(s->device,m->dim*slots*4);s->gate=buffer(s->device,ffn*slots*4);s->up=buffer(s->device,ffn*slots*4);s->route=m->is_moe?buffer(s->device,m->experts*4):NULL;s->expert_ids=m->is_moe?buffer(s->device,m->experts_used*4):NULL;s->expert_weights=m->is_moe?buffer(s->device,m->experts_used*4):NULL;s->scores=buffer(s->device,(uint64_t)context*m->heads*4);s->keys=buffer(s->device,kv);s->values=buffer(s->device,kv);s->logits=buffer(s->device,m->vocab*4);s->attention_partial=buffer(s->device,(uint64_t)m->heads*((context+63)/64)*(m->key_dim+2)*sizeof(float));s->qg=qwen35_arch(m)?buffer(s->device,(uint64_t)m->q_width*2*4):NULL;s->qkv_mixed=qwen35_arch(m)?buffer(s->device,(m->ssm_inner+2*m->ssm_groups*m->ssm_state)*sizeof(float)):NULL;s->conv_out=qwen35_arch(m)?buffer(s->device,(m->ssm_inner+2*m->ssm_groups*m->ssm_state)*sizeof(float)):NULL;s->z=qwen35_arch(m)?buffer(s->device,m->ssm_inner*4):NULL;s->alpha=qwen35_arch(m)?buffer(s->device,m->ssm_vheads*4):NULL;s->beta=qwen35_arch(m)?buffer(s->device,m->ssm_vheads*4):NULL;s->conv_state=qwen35_arch(m)?buffer(s->device,(uint64_t)m->layers*(m->ssm_inner+2*m->ssm_groups*m->ssm_state)*(m->ssm_conv-1)*4):NULL;s->ssm_state=qwen35_arch(m)?buffer(s->device,(uint64_t)m->layers*m->ssm_vheads*m->ssm_state*m->ssm_state*4):NULL;s->shared_gate=qwen35_arch(m)?buffer(s->device,4):NULL;s->batch_chunk=prefill_chunk_size(m);s->bx=buffer(s->device,(uint64_t)s->batch_chunk*m->dim*4);s->bnorm=buffer(s->device,(uint64_t)s->batch_chunk*m->dim*4);s->bq=buffer(s->device,(uint64_t)s->batch_chunk*m->q_width*4);s->bk=buffer(s->device,(uint64_t)s->batch_chunk*m->kv_heads*m->key_dim*4);s->bv=buffer(s->device,(uint64_t)s->batch_chunk*m->kv_heads*m->value_dim*4);s->batt=buffer(s->device,(uint64_t)s->batch_chunk*m->attn_width*4);s->btmp=buffer(s->device,(uint64_t)s->batch_chunk*m->dim*slots*4);s->bgate=buffer(s->device,(uint64_t)s->batch_chunk*ffn*slots*4);s->bup=buffer(s->device,(uint64_t)s->batch_chunk*ffn*slots*4);s->broute=m->is_moe?buffer(s->device,(uint64_t)s->batch_chunk*m->experts*4):NULL;s->bids=m->is_moe?buffer(s->device,(uint64_t)s->batch_chunk*m->experts_used*4):NULL;s->bw=m->is_moe?buffer(s->device,(uint64_t)s->batch_chunk*m->experts_used*4):NULL;uint32_t max_tiles=m->is_moe?matmul_id_max_tiles(m->experts,m->experts_used,s->batch_chunk):0;s->mm_id_tpe=m->is_moe?buffer(s->device,(uint64_t)(1+3*max_tiles)*sizeof(uint32_t)):NULL;s->mm_id_hids=m->is_moe?buffer(s->device,(uint64_t)(m->experts_used*s->batch_chunk+m->experts)*sizeof(int32_t)):NULL;if(!s->x||!s->norm_x||!s->q||!s->k||!s->v||!s->att||!s->tmp||!s->gate||!s->up||(m->is_moe&&(!s->route||!s->expert_ids||!s->expert_weights))||!s->scores||!s->keys||!s->values||!s->logits||!s->attention_partial||(qwen35_arch(m)&&(!s->qg||!s->qkv_mixed||!s->conv_out||!s->z||!s->alpha||!s->beta||!s->conv_state||!s->ssm_state||!s->shared_gate))||!s->bx||!s->bnorm||!s->bq||!s->bk||!s->bv||!s->batt||!s->btmp||!s->bgate||!s->bup||(m->is_moe&&(!s->broute||!s->bids||!s->bw||!s->mm_id_tpe||!s->mm_id_hids))){set_error(error,error_size,"cannot allocate Metal activations");goto bad;}
+    if (qwen35_arch(m)) {
+        uint32_t qk = m->ssm_groups * m->ssm_state;
+        uint32_t mixed = m->ssm_inner + 2 * qk;
+        uint32_t mix = m->ssm_inner > m->attn_width ? m->ssm_inner : m->attn_width;
+        uint64_t rows = s->batch_chunk;
+        s->hb_qkv = buffer(s->device, rows * mixed * sizeof(float));
+        s->hb_conv = buffer(s->device, rows * mixed * sizeof(float));
+        s->hb_dq = buffer(s->device, rows * qk * sizeof(float));
+        s->hb_dk = buffer(s->device, rows * qk * sizeof(float));
+        s->hb_z = buffer(s->device, rows * m->ssm_inner * sizeof(float));
+        s->hb_g = buffer(s->device, rows * m->ssm_vheads * sizeof(float));
+        s->hb_beta = buffer(s->device, rows * m->ssm_vheads * sizeof(float));
+        s->hb_mix = buffer(s->device, rows * mix * sizeof(float));
+        s->hb_qg = buffer(s->device, rows * 2 * m->q_width * sizeof(float));
+        s->hb_aq = buffer(s->device, rows * m->q_width * sizeof(float));
+        s->hb_agate = buffer(s->device, rows * m->q_width * sizeof(float));
+        s->hb_ak = buffer(s->device, rows * m->kv_heads * m->key_dim * sizeof(float));
+        s->hb_av = buffer(s->device, rows * m->kv_heads * m->value_dim * sizeof(float));
+        s->hb_out = buffer(s->device, rows * m->dim * sizeof(float));
+        s->hb_shg = buffer(s->device, rows * sizeof(float));
+        s->hb_sgate = buffer(s->device, rows * m->shared_hidden * sizeof(float));
+        s->hb_sup = buffer(s->device, rows * m->shared_hidden * sizeof(float));
+        s->hb_sdown = buffer(s->device, rows * m->dim * sizeof(float));
+        if (!s->hb_qkv || !s->hb_conv || !s->hb_dq || !s->hb_dk || !s->hb_z ||
+            !s->hb_g || !s->hb_beta || !s->hb_mix || !s->hb_qg || !s->hb_aq ||
+            !s->hb_agate || !s->hb_ak || !s->hb_av || !s->hb_out || !s->hb_shg ||
+            !s->hb_sgate || !s->hb_sup || !s->hb_sdown) {
+            set_error(error, error_size, "cannot allocate hybrid Metal activations");
+            goto bad;
+        }
+    }
+    *out=s;return 1;
 bad:dsm_metal_free(s);return 0;
 }
 void dsm_metal_free(dsm_metal *s){if(!s)return;if(s->profile.enabled)dsm_metal_profile_print(s);free(s->checkpoints);free(s->views);free(s);}
@@ -1157,6 +1217,114 @@ static void encode_layer_batch(dsm_metal *s, id<MTLComputeCommandEncoder> e,
         [e setComputePipelineState:s->moe_add_batch]; [e setBuffer:s->bx offset:0 atIndex:0]; [e setBuffer:s->btmp offset:0 atIndex:1]; [e setBuffer:s->bw offset:0 atIndex:2]; [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:3]; [e setBytes:&m->dim length:sizeof(m->dim) atIndex:4]; [e setBytes:&rows length:sizeof(rows) atIndex:5]; dispatch_1d(e, s->moe_add_batch, rows * m->dim);
     }
 }
+static void encode_hybrid_moe_batch(dsm_metal *s, id<MTLComputeCommandEncoder> e,
+                                    const dsm_layer *w, uint32_t rows) {
+    const dsm_model *m = s->m;
+    encode_f32_rows(s, e, w->gate_inp, s->bnorm, s->broute, rows, m->dim,
+                    m->experts);
+    encode_moe_topk_batch(s, e, rows);
+    int use_mm_id = mul_mm_id_enabled() && rows > 8 &&
+                    encode_expert_matmul(s, e, w->gate_exps, s->bnorm, s->bgate,
+                                         rows, 1, m->dim, m->expert_hidden) &&
+                    encode_expert_matmul(s, e, w->up_exps, s->bnorm, s->bup,
+                                         rows, 1, m->dim, m->expert_hidden);
+    if (use_mm_id) {
+        [e setComputePipelineState:s->expert_swiglu];
+        [e setBuffer:s->bgate offset:0 atIndex:0]; [e setBuffer:s->bup offset:0 atIndex:1];
+        [e setBytes:&m->expert_hidden length:sizeof(m->expert_hidden) atIndex:2];
+        [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:3];
+        [e setBytes:&rows length:sizeof(rows) atIndex:4];
+        dispatch_1d(e, s->expert_swiglu, rows * m->expert_hidden * m->experts_used);
+        use_mm_id = encode_expert_matmul(s, e, w->down_exps, s->bgate, s->btmp,
+                                         rows, m->experts_used, m->expert_hidden,
+                                         m->dim);
+    }
+    if (!use_mm_id) for (uint32_t row = 0; row < rows; ++row) {
+        NSUInteger x_off = (NSUInteger)row * m->dim * sizeof(float);
+        NSUInteger gate_off = (NSUInteger)row * m->experts_used * m->expert_hidden * sizeof(float);
+        NSUInteger tmp_off = (NSUInteger)row * m->experts_used * m->dim * sizeof(float);
+        encode_expert_gemv_batch_row(s, e, w->gate_exps, s->bnorm, x_off, s->bgate,
+                                     gate_off, row, 0, m->expert_hidden);
+        encode_expert_gemv_batch_row(s, e, w->up_exps, s->bnorm, x_off, s->bup,
+                                     gate_off, row, 0, m->expert_hidden);
+        uint32_t one = 1;
+        [e setComputePipelineState:s->expert_swiglu]; [e setBuffer:s->bgate offset:gate_off atIndex:0];
+        [e setBuffer:s->bup offset:gate_off atIndex:1]; [e setBytes:&m->expert_hidden length:sizeof(m->expert_hidden) atIndex:2];
+        [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:3]; [e setBytes:&one length:sizeof(one) atIndex:4];
+        dispatch_1d(e, s->expert_swiglu, m->expert_hidden * m->experts_used);
+        encode_expert_gemv_batch_row(s, e, w->down_exps, s->bgate, gate_off, s->btmp,
+                                     tmp_off, row, m->expert_hidden, m->dim);
+    }
+    [e setComputePipelineState:s->moe_add_batch]; [e setBuffer:s->bx offset:0 atIndex:0]; [e setBuffer:s->btmp offset:0 atIndex:1]; [e setBuffer:s->bw offset:0 atIndex:2];
+    [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:3]; [e setBytes:&m->dim length:sizeof(m->dim) atIndex:4]; [e setBytes:&rows length:sizeof(rows) atIndex:5]; dispatch_1d(e, s->moe_add_batch, rows * m->dim);
+    encode_f32_rows(s, e, w->gate_inp_shexp, s->bnorm, s->hb_shg, rows, m->dim, 1);
+    encode_matmul(s, e, w->gate_shexp, s->bnorm, s->hb_sgate, rows);
+    encode_matmul(s, e, w->up_shexp, s->bnorm, s->hb_sup, rows);
+    { uint32_t n = rows * m->shared_hidden; [e setComputePipelineState:s->swiglu]; [e setBuffer:s->hb_sgate offset:0 atIndex:0]; [e setBuffer:s->hb_sup offset:0 atIndex:1]; [e setBytes:&n length:sizeof(n) atIndex:2]; dispatch_1d(e, s->swiglu, n); }
+    encode_matmul(s, e, w->down_shexp, s->hb_sgate, s->hb_sdown, rows);
+    { uint32_t n = rows * m->dim; [e setComputePipelineState:s->shexp_add_batch]; [e setBuffer:s->bx offset:0 atIndex:0]; [e setBuffer:s->hb_sdown offset:0 atIndex:1]; [e setBuffer:s->hb_shg offset:0 atIndex:2]; [e setBytes:&m->dim length:sizeof(m->dim) atIndex:3]; [e setBytes:&n length:sizeof(n) atIndex:4]; dispatch_1d(e, s->shexp_add_batch, n); }
+}
+static void encode_layer_hybrid_batch(dsm_metal *s, id<MTLComputeCommandEncoder> e,
+                                      uint32_t layer, uint32_t pos0, uint32_t rows) {
+    const dsm_model *m = s->m;
+    const dsm_layer *w = &m->layer[layer];
+    uint32_t qk = m->ssm_groups * m->ssm_state;
+    uint32_t mixed = m->ssm_inner + 2 * qk;
+    encode_norm_at(s, e, s->bx, 0, w->attn_norm, s->bnorm, 0, m->dim, rows);
+    if (m->is_recurrent[layer]) {
+        encode_matmul(s, e, w->qkv, s->bnorm, s->hb_qkv, rows);
+        encode_matmul(s, e, w->z, s->bnorm, s->hb_z, rows);
+        encode_f32_rows(s, e, w->alpha, s->bnorm, s->hb_g, rows, m->dim, m->ssm_vheads);
+        encode_f32_rows(s, e, w->beta, s->bnorm, s->hb_beta, rows, m->dim, m->ssm_vheads);
+        id<MTLBuffer> wb; uint64_t off;
+        ssm_conv_batch_params conv = {mixed, m->ssm_conv - 1, rows};
+        if (!tensor_view(s, w->conv1d, &wb, &off)) return;
+        [e setComputePipelineState:s->ssm_conv_batch]; set_checked(e, s->hb_qkv, 0, (NSUInteger)rows * mixed * sizeof(float), 0); set_checked(e, s->conv_state, (NSUInteger)layer * mixed * (m->ssm_conv - 1) * sizeof(float), (NSUInteger)mixed * (m->ssm_conv - 1) * sizeof(float), 1); set_checked(e, wb, (NSUInteger)off, (NSUInteger)w->conv1d->bytes, 2); set_checked(e, s->hb_conv, 0, (NSUInteger)rows * mixed * sizeof(float), 3); [e setBytes:&conv length:sizeof(conv) atIndex:4]; dispatch_1d(e, s->ssm_conv_batch, mixed);
+        uint32_t n = rows * qk;
+        [e setComputePipelineState:s->split_gdn_qk_batch]; set_checked(e, s->hb_conv, 0, (NSUInteger)rows * mixed * sizeof(float), 0); set_checked(e, s->hb_dq, 0, (NSUInteger)n * sizeof(float), 1); set_checked(e, s->hb_dk, 0, (NSUInteger)n * sizeof(float), 2); [e setBytes:&qk length:sizeof(qk) atIndex:3]; [e setBytes:&mixed length:sizeof(mixed) atIndex:4]; [e setBytes:&n length:sizeof(n) atIndex:5]; dispatch_1d(e, s->split_gdn_qk_batch, n);
+        norm_params l2 = {m->ssm_state, rows * m->ssm_groups, m->rms_eps};
+        [e setComputePipelineState:s->l2norm]; set_checked(e, s->hb_dq, 0, (NSUInteger)n * sizeof(float), 0); [e setBytes:&l2 length:sizeof(l2) atIndex:1]; [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0]; [e dispatchThreadgroups:MTLSizeMake(l2.groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        set_checked(e, s->hb_dk, 0, (NSUInteger)n * sizeof(float), 0); [e dispatchThreadgroups:MTLSizeMake(l2.groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        n = rows * m->ssm_vheads; if (!tensor_view(s, w->dt_bias, &wb, &off)) return;
+        [e setComputePipelineState:s->gdn_gates_batch]; set_checked(e, s->hb_g, 0, (NSUInteger)n * sizeof(float), 0); set_checked(e, s->hb_beta, 0, (NSUInteger)n * sizeof(float), 1); set_checked(e, wb, (NSUInteger)off, (NSUInteger)w->dt_bias->bytes, 2); if (!tensor_view(s, w->ssm_a, &wb, &off)) return; set_checked(e, wb, (NSUInteger)off, (NSUInteger)w->ssm_a->bytes, 3); [e setBytes:&m->ssm_vheads length:sizeof(m->ssm_vheads) atIndex:4]; [e setBytes:&n length:sizeof(n) atIndex:5]; dispatch_1d(e, s->gdn_gates_batch, n);
+        gdn_batch_params gdn = {m->ssm_groups, m->ssm_vheads, m->ssm_state, layer, rows, qk, mixed, m->ssm_inner};
+        [e setComputePipelineState:s->gdn_batch]; set_checked(e, s->hb_dq, 0, (NSUInteger)rows * qk * sizeof(float), 0); set_checked(e, s->hb_dk, 0, (NSUInteger)rows * qk * sizeof(float), 1); set_checked(e, s->hb_conv, (NSUInteger)2 * qk * sizeof(float), (NSUInteger)(rows - 1) * mixed * sizeof(float) + m->ssm_inner * sizeof(float), 2); set_checked(e, s->hb_g, 0, (NSUInteger)rows * m->ssm_vheads * sizeof(float), 3); set_checked(e, s->hb_beta, 0, (NSUInteger)rows * m->ssm_vheads * sizeof(float), 4); set_checked(e, s->ssm_state, 0, s->ssm_state.length, 5); set_checked(e, s->hb_mix, 0, (NSUInteger)rows * m->ssm_inner * sizeof(float), 6); [e setBytes:&gdn length:sizeof(gdn) atIndex:7]; [e dispatchThreadgroups:MTLSizeMake((m->ssm_state + 3) / 4, m->ssm_vheads, 1) threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+        norm_params gated = {m->ssm_state, rows * m->ssm_vheads, m->rms_eps}; if (!tensor_view(s, w->ssm_norm, &wb, &off)) return;
+        [e setComputePipelineState:s->gated_rmsnorm]; set_checked(e, s->hb_mix, 0, (NSUInteger)rows * m->ssm_inner * sizeof(float), 0); set_checked(e, s->hb_z, 0, (NSUInteger)rows * m->ssm_inner * sizeof(float), 1); set_checked(e, wb, (NSUInteger)off, (NSUInteger)w->ssm_norm->bytes, 2); [e setBytes:&gated length:sizeof(gated) atIndex:3]; [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0]; [e dispatchThreadgroups:MTLSizeMake(gated.groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        encode_matmul(s, e, w->ssm_out, s->hb_mix, s->hb_out, rows);
+    } else {
+        encode_matmul(s, e, w->q, s->bnorm, s->hb_qg, rows); encode_matmul(s, e, w->k, s->bnorm, s->hb_ak, rows); encode_matmul(s, e, w->v, s->bnorm, s->hb_av, rows);
+        for (uint32_t row = 0; row < rows; ++row) { NSUInteger qg = (NSUInteger)row * 2 * m->q_width * sizeof(float), aq = (NSUInteger)row * m->q_width * sizeof(float); [e setComputePipelineState:s->split_q_gate]; set_checked(e, s->hb_qg, qg, (NSUInteger)2 * m->q_width * sizeof(float), 0); set_checked(e, s->hb_aq, aq, (NSUInteger)m->q_width * sizeof(float), 1); set_checked(e, s->hb_agate, aq, (NSUInteger)m->q_width * sizeof(float), 2); [e setBytes:&m->key_dim length:sizeof(m->key_dim) atIndex:3]; dispatch_1d(e, s->split_q_gate, m->q_width); }
+        encode_norm_at(s, e, s->hb_aq, 0, w->q_norm, s->hb_aq, 0, m->key_dim, rows * m->heads); encode_norm_at(s, e, s->hb_ak, 0, w->k_norm, s->hb_ak, 0, m->key_dim, rows * m->kv_heads);
+        for (uint32_t row = 0; row < rows; ++row) {
+            NSUInteger qoff = (NSUInteger)row * m->q_width * sizeof(float);
+            NSUInteger koff = (NSUInteger)row * m->kv_heads * m->key_dim * sizeof(float);
+            NSUInteger moff = (NSUInteger)row * m->attn_width * sizeof(float);
+            rope_partial_params rope = {m->heads, m->key_dim, m->rope_dims,
+                                        pos0 + row, m->rope_base};
+            [e setComputePipelineState:s->rope_partial]; set_checked(e, s->hb_aq, qoff, (NSUInteger)m->q_width * sizeof(float), 0); [e setBytes:&rope length:sizeof(rope) atIndex:1]; dispatch_1d(e, s->rope_partial, m->heads * (m->rope_dims / 2));
+            rope.heads = m->kv_heads;
+            [e setComputePipelineState:s->rope_partial]; set_checked(e, s->hb_ak, koff, (NSUInteger)m->kv_heads * m->key_dim * sizeof(float), 0); [e setBytes:&rope length:sizeof(rope) atIndex:1]; dispatch_1d(e, s->rope_partial, m->kv_heads * (m->rope_dims / 2));
+            (void)moff;
+        }
+        cache_batch_params cache = {m->attn_index[layer], pos0, s->context,
+                                    m->kv_heads * m->key_dim, rows};
+        [e setComputePipelineState:s->cache_batch]; set_checked(e, s->hb_ak, 0, (NSUInteger)rows * cache.width * sizeof(float), 0); set_checked(e, s->keys, 0, s->keys.length, 1); [e setBytes:&cache length:sizeof(cache) atIndex:2]; dispatch_1d(e, s->cache_batch, rows * cache.width);
+        [e setComputePipelineState:s->cache_batch]; set_checked(e, s->hb_av, 0, (NSUInteger)rows * cache.width * sizeof(float), 0); set_checked(e, s->values, 0, s->values.length, 1); [e setBytes:&cache length:sizeof(cache) atIndex:2]; dispatch_1d(e, s->cache_batch, rows * cache.width);
+        /* KV writes must precede attention; serial command encoding preserves this,
+           so encode the attention loop after cache setup. */
+        for (uint32_t row = 0; row < rows; ++row) {
+            encode_attention_decode_at(s, e, m->attn_index[layer], pos0 + row,
+                                       s->hb_aq, (NSUInteger)row * m->q_width * sizeof(float),
+                                       s->hb_mix, (NSUInteger)row * m->attn_width * sizeof(float));
+        }
+        { uint32_t n = rows * m->attn_width; [e setComputePipelineState:s->sigmoid_mul]; set_checked(e, s->hb_mix, 0, (NSUInteger)n * sizeof(float), 0); set_checked(e, s->hb_agate, 0, (NSUInteger)rows * m->q_width * sizeof(float), 1); [e setBytes:&n length:sizeof(n) atIndex:2]; dispatch_1d(e, s->sigmoid_mul, n); }
+        encode_matmul(s, e, w->o, s->hb_mix, s->hb_out, rows);
+    }
+    { uint32_t n = rows * m->dim; [e setComputePipelineState:s->add]; [e setBuffer:s->bx offset:0 atIndex:0]; [e setBuffer:s->hb_out offset:0 atIndex:1]; [e setBytes:&n length:sizeof(n) atIndex:2]; dispatch_1d(e, s->add, n); }
+    encode_norm_at(s, e, s->bx, 0, w->ffn_norm, s->bnorm, 0, m->dim, rows);
+    encode_hybrid_moe_batch(s, e, w, rows);
+}
 static int prefill_chunk(dsm_metal *s, const int32_t *tokens, uint32_t rows,
                          float *logits) {
     const dsm_model *m = s->m;
@@ -1171,7 +1339,10 @@ static int prefill_chunk(dsm_metal *s, const int32_t *tokens, uint32_t rows,
     }
     id<MTLCommandBuffer> cb = [s->queue commandBuffer];
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-    for (uint32_t layer = 0; layer < m->layers; ++layer) encode_layer_batch(s, e, layer, pos0, rows);
+    for (uint32_t layer = 0; layer < m->layers; ++layer) {
+        if (qwen35_arch(m)) encode_layer_hybrid_batch(s, e, layer, pos0, rows);
+        else encode_layer_batch(s, e, layer, pos0, rows);
+    }
     if (logits) {
         NSUInteger off = (NSUInteger)(rows - 1) * m->dim * sizeof(float);
         encode_norm_at(s, e, s->bx, off, m->output_norm, s->norm_x, 0, m->dim, 1);
@@ -1186,7 +1357,8 @@ static int prefill_chunk(dsm_metal *s, const int32_t *tokens, uint32_t rows,
 int dsm_metal_prefill(dsm_metal *s, const int32_t *tokens, uint32_t n,
                        float *logits) {
     if (!s || !tokens || !n || !logits || n > s->context - s->pos) return 0;
-    if (qwen35_arch(s->m) || s->profile.enabled || !prefill_enabled()) {
+    if ((qwen35_arch(s->m) && (!hybrid_prefill_enabled() || getenv("DSM_DUMP_DIR"))) ||
+        s->profile.enabled || !prefill_enabled()) {
         for (uint32_t i = 0; i < n; ++i) if (!dsm_metal_token(s, tokens[i], logits)) return 0;
         return 1;
     }
