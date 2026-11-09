@@ -928,6 +928,16 @@ static void encode_hybrid_moe(dsm_metal *s, id<MTLComputeCommandEncoder> e,
     [e setBytes:&m->dim length:sizeof(m->dim) atIndex:3];
     dispatch_1d(e, s->shexp_add, m->dim);
 }
+static void encode_hybrid_dense_ffn(dsm_metal *s,
+                                    id<MTLComputeCommandEncoder> e,
+                                    const dsm_layer *w) {
+    const dsm_model *m = s->m;
+    encode_gemv(s, e, w->gate, s->norm_x, s->gate);
+    encode_gemv(s, e, w->up, s->norm_x, s->up);
+    encode_simple(e, s->swiglu, s->gate, s->up, m->hidden);
+    encode_gemv(s, e, w->down, s->gate, s->tmp);
+    encode_simple(e, s->add, s->x, s->tmp, m->dim);
+}
 static void encode_layer_hybrid(dsm_metal *s, id<MTLComputeCommandEncoder> e,
                                 uint32_t layer) {
     const dsm_model *m = s->m;
@@ -1012,7 +1022,8 @@ static void encode_layer_hybrid(dsm_metal *s, id<MTLComputeCommandEncoder> e,
     }
     encode_simple(e, s->add, s->x, s->tmp, m->dim);
     encode_norm(s, e, s->x, w->ffn_norm, s->norm_x, m->dim, 1);
-    encode_hybrid_moe(s, e, w);
+    if (m->is_moe) encode_hybrid_moe(s, e, w);
+    else encode_hybrid_dense_ffn(s, e, w);
 }
 static void encode_layer(dsm_metal *s, id<MTLComputeCommandEncoder> e,
                          uint32_t layer) {
