@@ -32,4 +32,7 @@ int dsm_metal_expert_matmul_test(dsm_metal *state, const gguf_tensor *weights,
                                  uint32_t rows, uint32_t input_rows,
                                  float *output);
 
+int dsm_metal_hybrid_kernels_test(dsm_metal *state, uint32_t layer, uint32_t rows,
+                                  int nonzero_state, float *max_abs, float *max_rel);
+
 #endif

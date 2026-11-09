@@ -25,6 +25,8 @@ struct AttentionPrefill { uint heads, kv_heads, dim, pos0, context, layer, rows;
 struct RopePartial { uint heads, dim, rot, pos; float base; };
 struct SsmConv { uint width, history; };
 struct Gdn { uint qk_heads, v_heads, state_dim, layer; float eps; };
+struct SsmConvBatch { uint width, history, rows; };
+struct GdnBatch { uint qk_heads, v_heads, state_dim, layer, rows, qk_stride, v_stride, out_stride; };
 
 // Ported from llama.cpp ggml-metal/kernels/mul_mv.metal (MIT license).
 struct block_q8_0 { half d; char qs[32]; };
@@ -1099,12 +1101,59 @@ kernel void ssm_conv_step(device const float *input [[buffer(0)]],
     state[2] = input[channel];
 }
 
+// The channel owns the full chunk history, preserving the decode kernel's
+// arithmetic order and storing the last three raw inputs in decode layout.
+kernel void ssm_conv_batch(device const float *input [[buffer(0)]],
+                           device float *history [[buffer(1)]],
+                           device const float *weights [[buffer(2)]],
+                           device float *output [[buffer(3)]],
+                           constant SsmConvBatch &p [[buffer(4)]],
+                           uint channel [[thread_position_in_grid]]) {
+    if (channel >= p.width) return;
+    device float *state = history + channel * p.history;
+    device const float *w = weights + channel * (p.history + 1);
+    float s0 = state[0], s1 = state[1], s2 = state[2];
+    for (uint row = 0; row < p.rows; ++row) {
+        float in = input[row * p.width + channel];
+        float total = s0 * w[0] + s1 * w[1] + s2 * w[2] + in * w[3];
+        output[row * p.width + channel] = total / (1.0f + exp(-total));
+        s0 = s1; s1 = s2; s2 = in;
+    }
+    state[0] = s0; state[1] = s1; state[2] = s2;
+}
+
+kernel void split_gdn_qk_batch(device const float *input [[buffer(0)]],
+                               device float *q [[buffer(1)]],
+                               device float *k [[buffer(2)]],
+                               constant uint &qk_width [[buffer(3)]],
+                               constant uint &mixed_width [[buffer(4)]],
+                               uint index [[thread_position_in_grid]]) {
+    uint row = index / qk_width, column = index % qk_width;
+    q[index] = input[row * mixed_width + column];
+    k[index] = input[row * mixed_width + qk_width + column];
+}
+
 kernel void gdn_gates(device float *alpha [[buffer(0)]], device float *beta [[buffer(1)]],
                       device const float *dt_bias [[buffer(2)]], device const float *ssm_a [[buffer(3)]],
                       uint index [[thread_position_in_grid]]) {
     float x = alpha[index] + dt_bias[index];
     float softplus = x > 20.0f ? x : log(1.0f + exp(x));
     alpha[index] = ssm_a[index] * softplus;
+    beta[index] = 1.0f / (1.0f + exp(-beta[index]));
+}
+
+kernel void gdn_gates_batch(device float *alpha [[buffer(0)]],
+                            device float *beta [[buffer(1)]],
+                            device const float *dt_bias [[buffer(2)]],
+                            device const float *ssm_a [[buffer(3)]],
+                            constant uint &v_heads [[buffer(4)]],
+                            constant uint &n [[buffer(5)]],
+                            uint index [[thread_position_in_grid]]) {
+    if (index >= n) return;
+    uint head = index % v_heads;
+    float x = alpha[index] + dt_bias[head];
+    float softplus = x > 20.0f ? x : log(1.0f + exp(x));
+    alpha[index] = ssm_a[head] * softplus;
     beta[index] = 1.0f / (1.0f + exp(-beta[index]));
 }
 
@@ -1139,6 +1188,41 @@ kernel void gated_delta_net(device const float *q [[buffer(0)]], device const fl
     }
     y = simd_sum(y);
     if (lane == 0) output[head * p.state_dim + row] = y * rsqrt(float(p.state_dim));
+}
+
+// Each simdgroup owns one persistent state row and advances it serially over
+// the chunk. The lane/column order intentionally matches gated_delta_net.
+kernel void gated_delta_net_batch(device const float *q [[buffer(0)]],
+                                  device const float *k [[buffer(1)]],
+                                  device const float *v [[buffer(2)]],
+                                  device const float *g [[buffer(3)]],
+                                  device const float *beta [[buffer(4)]],
+                                  device float *state [[buffer(5)]],
+                                  device float *output [[buffer(6)]],
+                                  constant GdnBatch &p [[buffer(7)]],
+                                  ushort lane [[thread_index_in_simdgroup]],
+                                  ushort simdgroup [[simdgroup_index_in_threadgroup]],
+                                  uint2 group [[threadgroup_position_in_grid]]) {
+    uint head = group.y, row = group.x * 4 + simdgroup;
+    if (head >= p.v_heads || row >= p.state_dim) return;
+    uint qk_head = head % p.qk_heads;
+    device float *s = state + ((p.layer * p.v_heads + head) * p.state_dim + row) * p.state_dim;
+    float local[4];
+    for (uint j = 0; j < 4; ++j) local[j] = s[lane + 32 * j];
+    for (uint token = 0; token < p.rows; ++token) {
+        device const float *qv = q + token * p.qk_stride + qk_head * p.state_dim;
+        device const float *kv = k + token * p.qk_stride + qk_head * p.state_dim;
+        float decay = exp(g[token * p.v_heads + head]);
+        float sk = 0.0f;
+        for (uint j = 0; j < 4; ++j) { local[j] *= decay; sk += local[j] * kv[lane + 32 * j]; }
+        sk = simd_sum(sk);
+        float delta = (v[token * p.v_stride + head * p.state_dim + row] - sk) * beta[token * p.v_heads + head];
+        float y = 0.0f;
+        for (uint j = 0; j < 4; ++j) { local[j] += delta * kv[lane + 32 * j]; y += local[j] * qv[lane + 32 * j]; }
+        y = simd_sum(y);
+        if (lane == 0) output[token * p.out_stride + head * p.state_dim + row] = y * rsqrt(float(p.state_dim));
+    }
+    for (uint j = 0; j < 4; ++j) s[lane + 32 * j] = local[j];
 }
 
 kernel void gated_rmsnorm_silu(device float *x [[buffer(0)]], device const float *z [[buffer(1)]],
