@@ -544,13 +544,14 @@ int dsm_metal_init(dsm_metal **out,const dsm_model *m,uint32_t context,char *err
         s->hb_ak = buffer(s->device, rows * m->kv_heads * m->key_dim * sizeof(float));
         s->hb_av = buffer(s->device, rows * m->kv_heads * m->value_dim * sizeof(float));
         s->hb_out = buffer(s->device, rows * m->dim * sizeof(float));
-        s->hb_shg = buffer(s->device, rows * sizeof(float));
-        s->hb_sgate = buffer(s->device, rows * m->shared_hidden * sizeof(float));
-        s->hb_sup = buffer(s->device, rows * m->shared_hidden * sizeof(float));
+        uint32_t ffn_width = m->is_moe ? m->shared_hidden : m->hidden;
+        s->hb_shg = m->is_moe ? buffer(s->device, rows * sizeof(float)) : NULL;
+        s->hb_sgate = buffer(s->device, rows * ffn_width * sizeof(float));
+        s->hb_sup = buffer(s->device, rows * ffn_width * sizeof(float));
         s->hb_sdown = buffer(s->device, rows * m->dim * sizeof(float));
         if (!s->hb_qkv || !s->hb_conv || !s->hb_dq || !s->hb_dk || !s->hb_z ||
             !s->hb_g || !s->hb_beta || !s->hb_mix || !s->hb_qg || !s->hb_aq ||
-            !s->hb_agate || !s->hb_ak || !s->hb_av || !s->hb_out || !s->hb_shg ||
+            !s->hb_agate || !s->hb_ak || !s->hb_av || !s->hb_out ||
             !s->hb_sgate || !s->hb_sup || !s->hb_sdown) {
             set_error(error, error_size, "cannot allocate hybrid Metal activations");
             goto bad;
@@ -1303,8 +1304,8 @@ static void encode_layer_hybrid_batch(dsm_metal *s, id<MTLComputeCommandEncoder>
     if (m->is_recurrent[layer]) {
         encode_matmul(s, e, w->qkv, s->bnorm, s->hb_qkv, rows);
         encode_matmul(s, e, w->z, s->bnorm, s->hb_z, rows);
-        encode_f32_rows(s, e, w->alpha, s->bnorm, s->hb_g, rows, m->dim, m->ssm_vheads);
-        encode_f32_rows(s, e, w->beta, s->bnorm, s->hb_beta, rows, m->dim, m->ssm_vheads);
+        encode_matmul(s, e, w->alpha, s->bnorm, s->hb_g, rows);
+        encode_matmul(s, e, w->beta, s->bnorm, s->hb_beta, rows);
         id<MTLBuffer> wb; uint64_t off;
         ssm_conv_batch_params conv = {mixed, m->ssm_conv - 1, rows};
         if (!tensor_view(s, w->conv1d, &wb, &off)) return;
@@ -1352,7 +1353,21 @@ static void encode_layer_hybrid_batch(dsm_metal *s, id<MTLComputeCommandEncoder>
     }
     { uint32_t n = rows * m->dim; [e setComputePipelineState:s->add]; [e setBuffer:s->bx offset:0 atIndex:0]; [e setBuffer:s->hb_out offset:0 atIndex:1]; [e setBytes:&n length:sizeof(n) atIndex:2]; dispatch_1d(e, s->add, n); }
     encode_norm_at(s, e, s->bx, 0, w->ffn_norm, s->bnorm, 0, m->dim, rows);
-    encode_hybrid_moe_batch(s, e, w, rows);
+    if (m->is_moe) {
+        encode_hybrid_moe_batch(s, e, w, rows);
+    } else {
+        encode_matmul(s, e, w->gate, s->bnorm, s->hb_sgate, rows);
+        encode_matmul(s, e, w->up, s->bnorm, s->hb_sup, rows);
+        { uint32_t n = rows * m->hidden; [e setComputePipelineState:s->swiglu];
+          set_checked(e, s->hb_sgate, 0, (NSUInteger)n * sizeof(float), 0);
+          set_checked(e, s->hb_sup, 0, (NSUInteger)n * sizeof(float), 1);
+          [e setBytes:&n length:sizeof(n) atIndex:2]; dispatch_1d(e, s->swiglu, n); }
+        encode_matmul(s, e, w->down, s->hb_sgate, s->hb_sdown, rows);
+        { uint32_t n = rows * m->dim; [e setComputePipelineState:s->add];
+          set_checked(e, s->bx, 0, (NSUInteger)n * sizeof(float), 0);
+          set_checked(e, s->hb_sdown, 0, (NSUInteger)n * sizeof(float), 1);
+          [e setBytes:&n length:sizeof(n) atIndex:2]; dispatch_1d(e, s->add, n); }
+    }
 }
 static int prefill_chunk(dsm_metal *s, const int32_t *tokens, uint32_t rows,
                          float *logits) {
