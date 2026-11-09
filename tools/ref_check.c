@@ -343,9 +343,6 @@ int main(int argc, char **argv) {
     if (prefill && dsm_dump_path) { fprintf(stderr, "check-ref: --prefill cannot read a DSM dump\n"); goto done; }
     if (prefill && reference_header.n_positions != 1) { fprintf(stderr, "check-ref: --prefill requires one llama logit record\n"); goto done; }
     if (prefill && !(metal && dsm_metal_prefill(metal, ids, (uint32_t)n_ids, dsm))) { fprintf(stderr, "check-ref: DSM prefill failed\n"); goto done; }
-    if (prefill && dsm_dump_path) { fprintf(stderr, "check-ref: --prefill cannot read a DSM dump\n"); goto done; }
-    if (prefill && reference_header.n_positions != 1) { fprintf(stderr, "check-ref: --prefill requires one llama logit record\n"); goto done; }
-    if (prefill && !(metal && dsm_metal_prefill(metal, ids, (uint32_t)n_ids, dsm))) { fprintf(stderr, "check-ref: DSM prefill failed\n"); goto done; }
     double max_kl = 0, sum_overlap = 0;
     float max_abs = 0;
     uint32_t top1_matches = 0, first_divergence = UINT32_MAX;
