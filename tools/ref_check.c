@@ -35,7 +35,7 @@ typedef struct {
 static void usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s MODEL.gguf IDS.txt LLAMA.bin [--backend metal|cpu]\n"
-            "       [--floor F] [--dump-dsm DSM.bin | --dsm-dump DSM.bin]\n",
+            "       [--floor F] [--prefill] [--dump-dsm DSM.bin | --dsm-dump DSM.bin]\n",
             argv0);
     fprintf(stderr, "       %s --compare-dumps REF.bin TEST.bin [--floor F]\n", argv0);
 }
@@ -220,6 +220,7 @@ int main(int argc, char **argv) {
     const char *model_path, *ids_path, *reference_path, *backend = "metal";
     const char *dsm_dump_path = NULL, *write_dsm_path = NULL;
     double floor = 0;
+    bool prefill = false;
     int32_t *ids = NULL;
     size_t n_ids = 0;
     FILE *reference_file = NULL, *dsm_file = NULL;
@@ -262,6 +263,7 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[arg], "--dsm-dump") && arg + 1 < argc) dsm_dump_path = argv[++arg];
         else if (!strcmp(argv[arg], "--dump-dsm") && arg + 1 < argc) write_dsm_path = argv[++arg];
+        else if (!strcmp(argv[arg], "--prefill")) prefill = true;
         else {
             usage(argv[0]);
             return 2;
@@ -338,6 +340,12 @@ int main(int argc, char **argv) {
         goto done;
     }
 
+    if (prefill && dsm_dump_path) { fprintf(stderr, "check-ref: --prefill cannot read a DSM dump\n"); goto done; }
+    if (prefill && reference_header.n_positions != 1) { fprintf(stderr, "check-ref: --prefill requires one llama logit record\n"); goto done; }
+    if (prefill && !(metal && dsm_metal_prefill(metal, ids, (uint32_t)n_ids, dsm))) { fprintf(stderr, "check-ref: DSM prefill failed\n"); goto done; }
+    if (prefill && dsm_dump_path) { fprintf(stderr, "check-ref: --prefill cannot read a DSM dump\n"); goto done; }
+    if (prefill && reference_header.n_positions != 1) { fprintf(stderr, "check-ref: --prefill requires one llama logit record\n"); goto done; }
+    if (prefill && !(metal && dsm_metal_prefill(metal, ids, (uint32_t)n_ids, dsm))) { fprintf(stderr, "check-ref: DSM prefill failed\n"); goto done; }
     double max_kl = 0, sum_overlap = 0;
     float max_abs = 0;
     uint32_t top1_matches = 0, first_divergence = UINT32_MAX;
@@ -357,7 +365,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "check-ref: DSM record %u does not match llama position\n", row);
                 goto done;
             }
-        } else {
+        } else if (!prefill) {
             while (next_position <= reference_position) {
                 int ok = metal ? dsm_metal_token(metal, ids[next_position], dsm)
                                : dsm_forward_token(forward, ids[next_position], dsm);
