@@ -22,7 +22,8 @@
 #include <string.h>
 #include <sys/stat.h>
 
-enum { REF_VERSION = 2, REF_HEADER_BYTES = 32, REF_BATCH = 512 };
+enum { REF_VERSION = 2, REF_HEADER_BYTES = 32 };
+static uint32_t REF_BATCH = 512;
 
 typedef struct {
     char magic[8];
@@ -172,6 +173,7 @@ static uint32_t argmax(const float *logits, uint32_t vocab) {
 }
 
 int main(int argc, char **argv) {
+    if (getenv("REF_BATCH")) REF_BATCH = (uint32_t)atoi(getenv("REF_BATCH"));
     const char *model_path = NULL, *ids_path = NULL, *out_path = NULL;
     const char *selection = "all", *patterns = NULL, *tensor_dir = NULL;
     int32_t n_gpu_layers = -1;
