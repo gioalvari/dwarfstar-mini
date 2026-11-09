@@ -304,6 +304,15 @@ After the fix:
   - `rewind(k)` for k in {0, ckpt, ckpt+5} then prefill gives the same result
     as fresh.
 
+**Result 2d (2026-11-09, bc49544).** `dsm_metal_rewind` restores a lazy
+`DSM_CKPT` (2--4, default 3) ring of 83.75 MiB recurrent-state snapshots and
+invalidates future snapshots after every branch. The server checkpoints before
+the final `<|im_start|>` (or last token) and after the prompt, so reasoning
+stripping can restore the assistant-header prefix. `check-rewind` passed 19 and
+581 token prompts at rewind 0/checkpoint/checkpoint+5 with KL 0, same argmax,
+top-5, and 32-token greedy continuations; checkpoint copies measured 3.2--11.0
+ms while another GPU lane was active.
+
 ## Step 3: prefill (batched) via existing mul_mm / mul_mm_id
 
 `encode_layer_hybrid_batch`. Size: L.
