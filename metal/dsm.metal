@@ -332,6 +332,28 @@ kernel void f32_gemv(device const float *w [[buffer(0)]], device const float *x 
     if (!tid) y[row] = sum[0];
 }
 
+struct GemvRows { uint in, out, rows, x_stride, y_stride; };
+kernel void f32_gemv_rows(device const float *w [[buffer(0)]],
+                          device const float *x [[buffer(1)]],
+                          device float *y [[buffer(2)]],
+                          constant GemvRows &p [[buffer(3)]],
+                          ushort tid [[thread_index_in_threadgroup]],
+                          uint2 group [[threadgroup_position_in_grid]],
+                          threadgroup float *sum [[threadgroup(0)]]) {
+    uint out = group.x, row = group.y;
+    if (out >= p.out || row >= p.rows) return;
+    const device float *wr = w + out * p.in;
+    const device float *xr = x + row * p.x_stride;
+    float value = 0.0f;
+    for (uint j = tid; j < p.in; j += 256) value += wr[j] * xr[j];
+    sum[tid] = value; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) {
+        if (tid < step) sum[tid] += sum[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (!tid) y[row * p.y_stride + out] = sum[0];
+}
+
 inline float k_f16(device const uchar *p) { return float(as_type<half>(*reinterpret_cast<const device ushort *>(p))); }
 inline uchar k4_scale(device const uchar *s, uint index, bool minv) {
     if (index < 4) return s[index + (minv ? 4 : 0)] & 63;
