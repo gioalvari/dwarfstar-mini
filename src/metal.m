@@ -1304,8 +1304,11 @@ static void encode_layer_hybrid_batch(dsm_metal *s, id<MTLComputeCommandEncoder>
     if (m->is_recurrent[layer]) {
         encode_matmul(s, e, w->qkv, s->bnorm, s->hb_qkv, rows);
         encode_matmul(s, e, w->z, s->bnorm, s->hb_z, rows);
-        encode_matmul(s, e, w->alpha, s->bnorm, s->hb_g, rows);
-        encode_matmul(s, e, w->beta, s->bnorm, s->hb_beta, rows);
+        /* qwen35moe ships F32 alpha/beta, dense qwen35 ships Q8_0. */
+        if (w->alpha->type == GGML_TYPE_F32) encode_f32_rows(s, e, w->alpha, s->bnorm, s->hb_g, rows, m->dim, m->ssm_vheads);
+        else encode_matmul(s, e, w->alpha, s->bnorm, s->hb_g, rows);
+        if (w->beta->type == GGML_TYPE_F32) encode_f32_rows(s, e, w->beta, s->bnorm, s->hb_beta, rows, m->dim, m->ssm_vheads);
+        else encode_matmul(s, e, w->beta, s->bnorm, s->hb_beta, rows);
         id<MTLBuffer> wb; uint64_t off;
         ssm_conv_batch_params conv = {mixed, m->ssm_conv - 1, rows};
         if (!tensor_view(s, w->conv1d, &wb, &off)) return;
