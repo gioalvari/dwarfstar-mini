@@ -337,6 +337,41 @@ ms while another GPU lane was active.
   - split-prompt test: prefill(a) + prefill(b) == prefill(a‖b) (state carry);
   - `check-ref` on the last-token logits with the same thresholds as Step 2.
 
+### Result 3 (2026-11-09)
+
+Batched hybrid prefill is on by default for qwen35 (`DSM_HYBRID_PREFILL=0`
+falls back to the token loop). It uses dedicated `hb_*` buffers, one command
+buffer per chunk, one serial `gated_delta_net_batch` dispatch per DeltaNet
+layer, and row-by-row decode attention kernels (dim 256 `attention_prefill`
+is M2).
+
+- Drift root cause: precision, not indexing. With chunk rows ≤ 8 (GEMV path)
+  the batch path is bit-exact with the token loop. Above that, half-precision
+  staging in `kernel_mul_mm`/`kernel_mul_mm_id` (rel ~3e-4 per op) flips
+  near-tied expert choices (first flip: layer 1, gap 1e-4), and the recurrent
+  state carries the flip forward. llama.cpp shows the same order of drift
+  between its batched and token-by-token runs (last-position KL 1.3e-4 at
+  n=33, 2.4e-3 at n=513, 2.8e-2 at n=570).
+- Fix: FP32-staged `mul_mm_*_f32` / `mul_mm_id_*_f32` (12 KiB threadgroup
+  memory), used by default for qwen35 only (`DSM_MM_F32=0|1` overrides).
+  qwen3/qwen3moe keep the half kernels and are unchanged.
+- `check-prefill` (Qwen3.6, 570-token repeated prompt P), chunk 512:
+  n=33 KL 5.4e-13, n=100 1.4e-13, n=300 3.5e-6, n=511 1.2e-7,
+  n=512 7.0e-6, n=513 1.3e-5 (max_dprob 4.2e-4), n=570 4.7e-6 with 64-token
+  greedy identical; split 1/100/300 pass (split 100 and 300 are identical to
+  the unsplit run). Chunk 7, n ∈ {1, 2, 3, 4, 33}: exact (max_abs 0).
+- n=1500: KL 3.5e-8, top-5 same, but greedy differs from DSM's token loop at
+  token 46. The hybrid continuation is byte-identical to llama.cpp
+  token-by-token (`REF_BATCH=1 ./llama-ref ... --greedy 64`); llama's batched
+  run diverges at byte 230 and DSM's token loop at byte 133. So the token loop
+  is the outlier there, and the greedy gate at n ≥ 1000 compares against
+  llama token-by-token instead.
+- `check-metal-gemv` with FP32 staging: per-op rel ≤ 8.2e-7. `check-rewind`
+  on P: KL 0. Server: 3 chat turns with checkpoint reuse, fresh-restart turn 3
+  identical to the warm run.
+- Speed (`./dsm -p P -n 16`, 570 tokens): token loop 52-53 tok/s, batched
+  455-479 tok/s (≥ 302 target; llama pp512 754). FP32 staging costs ≤ 3%.
+
 ## Step 4: performance (only after Steps 0-3 are green)
 
 - Baseline (2026-11-08, llama.cpp build 9860 `fdb1db877`, GPU idle): pp512

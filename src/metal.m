@@ -138,7 +138,7 @@ static int prefill_enabled(void) {
 }
 static int hybrid_prefill_enabled(void) {
     const char *value = getenv("DSM_HYBRID_PREFILL");
-    return value && !strcmp(value, "1");
+    return !value || strcmp(value, "0");
 }
 static int mul_mm_id_enabled(void) {
     const char *value = getenv("DSM_MUL_MM_ID");
