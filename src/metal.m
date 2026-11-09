@@ -1113,6 +1113,8 @@ static int encode_expert_matmul(dsm_metal *s, id<MTLComputeCommandEncoder> e,
         .ne21 = (int32_t)rows, .ne20 = (int32_t)m->experts_used,
         .nb21 = m->experts_used * sizeof(uint32_t),
     };
+    static int map0_mode = -1; if (map0_mode < 0) map0_mode = getenv("DSM_MAP0") ? atoi(getenv("DSM_MAP0")) : 1;
+    extern int dsm_map0_skip, dsm_map0_only; if (!map0_mode || dsm_map0_skip) goto skip_map0;
     [e setComputePipelineState:s->mm_id_map0];
     [e setBytes:&map length:sizeof(map) atIndex:0];
     [e setBuffer:s->bids offset:0 atIndex:1];
@@ -1121,6 +1123,8 @@ static int encode_expert_matmul(dsm_metal *s, id<MTLComputeCommandEncoder> e,
     [e setThreadgroupMemoryLength:(NSUInteger)(2 * m->experts * sizeof(uint32_t)) atIndex:0];
     [e dispatchThreadgroups:MTLSizeMake(1, 1, 1)
  threadsPerThreadgroup:MTLSizeMake(m->experts, 1, 1)];
+    if (dsm_map0_only) return 1;
+skip_map0:;
     mul_mm_id_params args = {
         .ne00 = (int32_t)w->dims[0], .ne02 = (int32_t)m->experts,
         .nb01 = w->bytes / w->dims[1] / m->experts,
@@ -1247,28 +1251,45 @@ static void encode_layer_batch(dsm_metal *s, id<MTLComputeCommandEncoder> e,
         [e setComputePipelineState:s->moe_add_batch]; [e setBuffer:s->bx offset:0 atIndex:0]; [e setBuffer:s->btmp offset:0 atIndex:1]; [e setBuffer:s->bw offset:0 atIndex:2]; [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:3]; [e setBytes:&m->dim length:sizeof(m->dim) atIndex:4]; [e setBytes:&rows length:sizeof(rows) atIndex:5]; dispatch_1d(e, s->moe_add_batch, rows * m->dim);
     }
 }
+/* PROFILING (scratch only): 0 = all; else only that stage is encoded.
+   1 norm+mixer in-proj, 2 mixer elementwise (conv/l2/gates/gnorm | split/norm/rope/cache/sigmoid),
+   3 out-proj+add+ffn_norm, 4 router+topk, 5 routed experts+moe_add, 6 shared expert / dense FFN,
+   7 gdn recurrence, 8 attention row loop */
+int dsm_map0_skip, dsm_map0_only;
+static int dbg_stage;
+double dsm_stage_gpu[9][2];
+#define ST(n) (dbg_stage == 0 || dbg_stage == (n))
 static void encode_hybrid_moe_batch(dsm_metal *s, id<MTLComputeCommandEncoder> e,
                                     const dsm_layer *w, uint32_t rows) {
     const dsm_model *m = s->m;
-    encode_f32_rows(s, e, w->gate_inp, s->bnorm, s->broute, rows, m->dim,
+    if (ST(4)) { encode_f32_rows(s, e, w->gate_inp, s->bnorm, s->broute, rows, m->dim,
                     m->experts);
-    encode_moe_topk_batch(s, e, rows);
-    int use_mm_id = mul_mm_id_enabled() && rows > 8 &&
-                    encode_expert_matmul(s, e, w->gate_exps, s->bnorm, s->bgate,
-                                         rows, 1, m->dim, m->expert_hidden) &&
-                    encode_expert_matmul(s, e, w->up_exps, s->bnorm, s->bup,
-                                         rows, 1, m->dim, m->expert_hidden);
-    if (use_mm_id) {
+    encode_moe_topk_batch(s, e, rows); }
+    if (ST(5)) {
+    static int parts = -1; if (parts < 0) parts = getenv("DSM_EXP_PARTS") ? atoi(getenv("DSM_EXP_PARTS")) : 31;
+    static int once = -1; if (once < 0) once = getenv("DSM_MAP0_ONCE") != NULL;
+    int use_mm_id = mul_mm_id_enabled() && rows > 8;
+    static int dup = -1; if (dup < 0) dup = getenv("DSM_EXP_DUP") ? atoi(getenv("DSM_EXP_DUP")) : 0;
+    if (use_mm_id && (parts & 1)) use_mm_id = encode_expert_matmul(s, e, w->gate_exps, s->bnorm, s->bgate, rows, 1, m->dim, m->expert_hidden);
+    if (use_mm_id && (dup & 1)) encode_expert_matmul(s, e, w->gate_exps, s->bnorm, s->bgate, rows, 1, m->dim, m->expert_hidden);
+    if (use_mm_id && (dup & 32)) { int sk = dsm_map0_skip; dsm_map0_skip = 0; dsm_map0_only = 1; encode_expert_matmul(s, e, w->gate_exps, s->bnorm, s->bgate, rows, 1, m->dim, m->expert_hidden); dsm_map0_only = 0; dsm_map0_skip = sk; }
+    if (once) dsm_map0_skip = 1;
+    if (use_mm_id && (parts & 2)) use_mm_id = encode_expert_matmul(s, e, w->up_exps, s->bnorm, s->bup, rows, 1, m->dim, m->expert_hidden);
+    if (use_mm_id && (dup & 2)) encode_expert_matmul(s, e, w->up_exps, s->bnorm, s->bup, rows, 1, m->dim, m->expert_hidden);
+    if (use_mm_id && (parts & 4)) {
         [e setComputePipelineState:s->expert_swiglu];
         [e setBuffer:s->bgate offset:0 atIndex:0]; [e setBuffer:s->bup offset:0 atIndex:1];
         [e setBytes:&m->expert_hidden length:sizeof(m->expert_hidden) atIndex:2];
         [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:3];
         [e setBytes:&rows length:sizeof(rows) atIndex:4];
         dispatch_1d(e, s->expert_swiglu, rows * m->expert_hidden * m->experts_used);
-        use_mm_id = encode_expert_matmul(s, e, w->down_exps, s->bgate, s->btmp,
+    }
+    if (use_mm_id && (parts & 8)) use_mm_id = encode_expert_matmul(s, e, w->down_exps, s->bgate, s->btmp,
                                          rows, m->experts_used, m->expert_hidden,
                                          m->dim);
-    }
+    if (use_mm_id && (dup & 8)) encode_expert_matmul(s, e, w->down_exps, s->bgate, s->btmp, rows, m->experts_used, m->expert_hidden, m->dim);
+    dsm_map0_skip = 0;
+    if (!(parts & 16)) return;
     if (!use_mm_id) for (uint32_t row = 0; row < rows; ++row) {
         NSUInteger x_off = (NSUInteger)row * m->dim * sizeof(float);
         NSUInteger gate_off = (NSUInteger)row * m->experts_used * m->expert_hidden * sizeof(float);
@@ -1287,6 +1308,8 @@ static void encode_hybrid_moe_batch(dsm_metal *s, id<MTLComputeCommandEncoder> e
     }
     [e setComputePipelineState:s->moe_add_batch]; [e setBuffer:s->bx offset:0 atIndex:0]; [e setBuffer:s->btmp offset:0 atIndex:1]; [e setBuffer:s->bw offset:0 atIndex:2];
     [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:3]; [e setBytes:&m->dim length:sizeof(m->dim) atIndex:4]; [e setBytes:&rows length:sizeof(rows) atIndex:5]; dispatch_1d(e, s->moe_add_batch, rows * m->dim);
+    }
+    if (!ST(6)) return;
     encode_f32_rows(s, e, w->gate_inp_shexp, s->bnorm, s->hb_shg, rows, m->dim, 1);
     encode_matmul(s, e, w->gate_shexp, s->bnorm, s->hb_sgate, rows);
     encode_matmul(s, e, w->up_shexp, s->bnorm, s->hb_sup, rows);
@@ -1300,8 +1323,9 @@ static void encode_layer_hybrid_batch(dsm_metal *s, id<MTLComputeCommandEncoder>
     const dsm_layer *w = &m->layer[layer];
     uint32_t qk = m->ssm_groups * m->ssm_state;
     uint32_t mixed = m->ssm_inner + 2 * qk;
-    encode_norm_at(s, e, s->bx, 0, w->attn_norm, s->bnorm, 0, m->dim, rows);
+    if (ST(1)) encode_norm_at(s, e, s->bx, 0, w->attn_norm, s->bnorm, 0, m->dim, rows);
     if (m->is_recurrent[layer]) {
+        if (ST(1)) {
         encode_matmul(s, e, w->qkv, s->bnorm, s->hb_qkv, rows);
         encode_matmul(s, e, w->z, s->bnorm, s->hb_z, rows);
         /* qwen35moe ships F32 alpha/beta, dense qwen35 ships Q8_0. */
@@ -1309,7 +1333,9 @@ static void encode_layer_hybrid_batch(dsm_metal *s, id<MTLComputeCommandEncoder>
         else encode_matmul(s, e, w->alpha, s->bnorm, s->hb_g, rows);
         if (w->beta->type == GGML_TYPE_F32) encode_f32_rows(s, e, w->beta, s->bnorm, s->hb_beta, rows, m->dim, m->ssm_vheads);
         else encode_matmul(s, e, w->beta, s->bnorm, s->hb_beta, rows);
+        }
         id<MTLBuffer> wb; uint64_t off;
+        if (ST(2)) {
         ssm_conv_batch_params conv = {mixed, m->ssm_conv - 1, rows};
         if (!tensor_view(s, w->conv1d, &wb, &off)) return;
         [e setComputePipelineState:s->ssm_conv_batch]; set_checked(e, s->hb_qkv, 0, (NSUInteger)rows * mixed * sizeof(float), 0); set_checked(e, s->conv_state, (NSUInteger)layer * mixed * (m->ssm_conv - 1) * sizeof(float), (NSUInteger)mixed * (m->ssm_conv - 1) * sizeof(float), 1); set_checked(e, wb, (NSUInteger)off, (NSUInteger)w->conv1d->bytes, 2); set_checked(e, s->hb_conv, 0, (NSUInteger)rows * mixed * sizeof(float), 3); [e setBytes:&conv length:sizeof(conv) atIndex:4]; dispatch_1d(e, s->ssm_conv_batch, mixed);
@@ -1320,13 +1346,19 @@ static void encode_layer_hybrid_batch(dsm_metal *s, id<MTLComputeCommandEncoder>
         set_checked(e, s->hb_dk, 0, (NSUInteger)n * sizeof(float), 0); [e dispatchThreadgroups:MTLSizeMake(l2.groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         n = rows * m->ssm_vheads; if (!tensor_view(s, w->dt_bias, &wb, &off)) return;
         [e setComputePipelineState:s->gdn_gates_batch]; set_checked(e, s->hb_g, 0, (NSUInteger)n * sizeof(float), 0); set_checked(e, s->hb_beta, 0, (NSUInteger)n * sizeof(float), 1); set_checked(e, wb, (NSUInteger)off, (NSUInteger)w->dt_bias->bytes, 2); if (!tensor_view(s, w->ssm_a, &wb, &off)) return; set_checked(e, wb, (NSUInteger)off, (NSUInteger)w->ssm_a->bytes, 3); [e setBytes:&m->ssm_vheads length:sizeof(m->ssm_vheads) atIndex:4]; [e setBytes:&n length:sizeof(n) atIndex:5]; dispatch_1d(e, s->gdn_gates_batch, n);
+        }
+        if (ST(7)) {
         gdn_batch_params gdn = {m->ssm_groups, m->ssm_vheads, m->ssm_state, layer, rows, qk, mixed, m->ssm_inner};
         [e setComputePipelineState:s->gdn_batch]; set_checked(e, s->hb_dq, 0, (NSUInteger)rows * qk * sizeof(float), 0); set_checked(e, s->hb_dk, 0, (NSUInteger)rows * qk * sizeof(float), 1); set_checked(e, s->hb_conv, (NSUInteger)2 * qk * sizeof(float), (NSUInteger)(rows - 1) * mixed * sizeof(float) + m->ssm_inner * sizeof(float), 2); set_checked(e, s->hb_g, 0, (NSUInteger)rows * m->ssm_vheads * sizeof(float), 3); set_checked(e, s->hb_beta, 0, (NSUInteger)rows * m->ssm_vheads * sizeof(float), 4); set_checked(e, s->ssm_state, 0, s->ssm_state.length, 5); set_checked(e, s->hb_mix, 0, (NSUInteger)rows * m->ssm_inner * sizeof(float), 6); [e setBytes:&gdn length:sizeof(gdn) atIndex:7]; [e dispatchThreadgroups:MTLSizeMake((m->ssm_state + 3) / 4, m->ssm_vheads, 1) threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+        }
+        if (ST(2)) {
         norm_params gated = {m->ssm_state, rows * m->ssm_vheads, m->rms_eps}; if (!tensor_view(s, w->ssm_norm, &wb, &off)) return;
         [e setComputePipelineState:s->gated_rmsnorm]; set_checked(e, s->hb_mix, 0, (NSUInteger)rows * m->ssm_inner * sizeof(float), 0); set_checked(e, s->hb_z, 0, (NSUInteger)rows * m->ssm_inner * sizeof(float), 1); set_checked(e, wb, (NSUInteger)off, (NSUInteger)w->ssm_norm->bytes, 2); [e setBytes:&gated length:sizeof(gated) atIndex:3]; [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0]; [e dispatchThreadgroups:MTLSizeMake(gated.groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        encode_matmul(s, e, w->ssm_out, s->hb_mix, s->hb_out, rows);
+        }
+        if (ST(3)) encode_matmul(s, e, w->ssm_out, s->hb_mix, s->hb_out, rows);
     } else {
-        encode_matmul(s, e, w->q, s->bnorm, s->hb_qg, rows); encode_matmul(s, e, w->k, s->bnorm, s->hb_ak, rows); encode_matmul(s, e, w->v, s->bnorm, s->hb_av, rows);
+        if (ST(1)) { encode_matmul(s, e, w->q, s->bnorm, s->hb_qg, rows); encode_matmul(s, e, w->k, s->bnorm, s->hb_ak, rows); encode_matmul(s, e, w->v, s->bnorm, s->hb_av, rows); }
+        if (ST(2)) {
         for (uint32_t row = 0; row < rows; ++row) { NSUInteger qg = (NSUInteger)row * 2 * m->q_width * sizeof(float), aq = (NSUInteger)row * m->q_width * sizeof(float); [e setComputePipelineState:s->split_q_gate]; set_checked(e, s->hb_qg, qg, (NSUInteger)2 * m->q_width * sizeof(float), 0); set_checked(e, s->hb_aq, aq, (NSUInteger)m->q_width * sizeof(float), 1); set_checked(e, s->hb_agate, aq, (NSUInteger)m->q_width * sizeof(float), 2); [e setBytes:&m->key_dim length:sizeof(m->key_dim) atIndex:3]; dispatch_1d(e, s->split_q_gate, m->q_width); }
         encode_norm_at(s, e, s->hb_aq, 0, w->q_norm, s->hb_aq, 0, m->key_dim, rows * m->heads); encode_norm_at(s, e, s->hb_ak, 0, w->k_norm, s->hb_ak, 0, m->key_dim, rows * m->kv_heads);
         for (uint32_t row = 0; row < rows; ++row) {
@@ -1344,21 +1376,21 @@ static void encode_layer_hybrid_batch(dsm_metal *s, id<MTLComputeCommandEncoder>
                                     m->kv_heads * m->key_dim, rows};
         [e setComputePipelineState:s->cache_batch]; set_checked(e, s->hb_ak, 0, (NSUInteger)rows * cache.width * sizeof(float), 0); set_checked(e, s->keys, 0, s->keys.length, 1); [e setBytes:&cache length:sizeof(cache) atIndex:2]; dispatch_1d(e, s->cache_batch, rows * cache.width);
         [e setComputePipelineState:s->cache_batch]; set_checked(e, s->hb_av, 0, (NSUInteger)rows * cache.width * sizeof(float), 0); set_checked(e, s->values, 0, s->values.length, 1); [e setBytes:&cache length:sizeof(cache) atIndex:2]; dispatch_1d(e, s->cache_batch, rows * cache.width);
-        /* KV writes must precede attention; serial command encoding preserves this,
-           so encode the attention loop after cache setup. */
+        }
+        if (ST(8))
         for (uint32_t row = 0; row < rows; ++row) {
             encode_attention_decode_at(s, e, m->attn_index[layer], pos0 + row,
                                        s->hb_aq, (NSUInteger)row * m->q_width * sizeof(float),
                                        s->hb_mix, (NSUInteger)row * m->attn_width * sizeof(float));
         }
-        { uint32_t n = rows * m->attn_width; [e setComputePipelineState:s->sigmoid_mul]; set_checked(e, s->hb_mix, 0, (NSUInteger)n * sizeof(float), 0); set_checked(e, s->hb_agate, 0, (NSUInteger)rows * m->q_width * sizeof(float), 1); [e setBytes:&n length:sizeof(n) atIndex:2]; dispatch_1d(e, s->sigmoid_mul, n); }
-        encode_matmul(s, e, w->o, s->hb_mix, s->hb_out, rows);
+        if (ST(2)) { uint32_t n = rows * m->attn_width; [e setComputePipelineState:s->sigmoid_mul]; set_checked(e, s->hb_mix, 0, (NSUInteger)n * sizeof(float), 0); set_checked(e, s->hb_agate, 0, (NSUInteger)rows * m->q_width * sizeof(float), 1); [e setBytes:&n length:sizeof(n) atIndex:2]; dispatch_1d(e, s->sigmoid_mul, n); }
+        if (ST(3)) encode_matmul(s, e, w->o, s->hb_mix, s->hb_out, rows);
     }
-    { uint32_t n = rows * m->dim; [e setComputePipelineState:s->add]; [e setBuffer:s->bx offset:0 atIndex:0]; [e setBuffer:s->hb_out offset:0 atIndex:1]; [e setBytes:&n length:sizeof(n) atIndex:2]; dispatch_1d(e, s->add, n); }
-    encode_norm_at(s, e, s->bx, 0, w->ffn_norm, s->bnorm, 0, m->dim, rows);
+    if (ST(3)) { uint32_t n = rows * m->dim; [e setComputePipelineState:s->add]; [e setBuffer:s->bx offset:0 atIndex:0]; [e setBuffer:s->hb_out offset:0 atIndex:1]; [e setBytes:&n length:sizeof(n) atIndex:2]; dispatch_1d(e, s->add, n);
+    encode_norm_at(s, e, s->bx, 0, w->ffn_norm, s->bnorm, 0, m->dim, rows); }
     if (m->is_moe) {
         encode_hybrid_moe_batch(s, e, w, rows);
-    } else {
+    } else if (ST(6)) {
         encode_matmul(s, e, w->gate, s->bnorm, s->hb_sgate, rows);
         encode_matmul(s, e, w->up, s->bnorm, s->hb_sup, rows);
         { uint32_t n = rows * m->hidden; [e setComputePipelineState:s->swiglu];
@@ -1386,6 +1418,17 @@ static int prefill_chunk(dsm_metal *s, const int32_t *tokens, uint32_t rows,
     }
     id<MTLCommandBuffer> cb = [s->queue commandBuffer];
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    static int prof = -1; if (prof < 0) prof = getenv("DSM_STAGE_PROF") != NULL;
+    if (prof && qwen35_arch(m)) {
+        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        for (uint32_t layer = 0; layer < m->layers; ++layer) for (int st = 1; st <= 8; ++st) {
+            cb = [s->queue commandBuffer]; e = [cb computeCommandEncoder]; dbg_stage = st;
+            encode_layer_hybrid_batch(s, e, layer, pos0, rows); dbg_stage = 0;
+            [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+            dsm_stage_gpu[st][m->is_recurrent[layer] ? 0 : 1] += cb.GPUEndTime - cb.GPUStartTime;
+        }
+        cb = [s->queue commandBuffer]; e = [cb computeCommandEncoder];
+    } else
     for (uint32_t layer = 0; layer < m->layers; ++layer) {
         if (qwen35_arch(m)) encode_layer_hybrid_batch(s, e, layer, pos0, rows);
         else encode_layer_batch(s, e, layer, pos0, rows);

@@ -4,7 +4,9 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
+extern double dsm_stage_gpu[9][2];
 
 static double now(void) {
     struct timespec time;
@@ -33,8 +35,12 @@ int main(int argc, char **argv) {
                             sizeof(error))) return 1;
         double start = now();
         if (!dsm_metal_prefill(metal, tokens.ids, (uint32_t)tokens.len, logits)) return 1;
-        printf("rep%d prefill %.2f tok/s\n", rep,
-               tokens.len / (now() - start));
+        printf("rep%d prefill %.2f tok/s (%zu tokens)\n", rep,
+               tokens.len / (now() - start), tokens.len);
+        if (getenv("DSM_STAGE_PROF")) { static const char *nm[9] = {"", "norm+in-proj", "mixer elementwise", "out-proj+add+norm", "router+topk", "routed experts", "shared/dense FFN", "GDN recurrence", "attention rows"};
+            double tot = 0; for (int i = 1; i < 9; ++i) tot += dsm_stage_gpu[i][0] + dsm_stage_gpu[i][1];
+            for (int i = 1; i < 9; ++i) printf("  %-20s rec %8.2f ms  attn %8.2f ms  share %5.1f%%  (%.3f ms/tok)\n", nm[i], dsm_stage_gpu[i][0]*1e3, dsm_stage_gpu[i][1]*1e3, 100*(dsm_stage_gpu[i][0]+dsm_stage_gpu[i][1])/tot, 1e3*(dsm_stage_gpu[i][0]+dsm_stage_gpu[i][1])/tokens.len);
+            printf("  total GPU %.1f ms = %.1f tok/s\n", tot*1e3, tokens.len/tot); memset(dsm_stage_gpu, 0, sizeof(dsm_stage_gpu)); }
         dsm_metal_free(metal);
     }
     free(logits);
