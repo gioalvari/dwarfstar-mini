@@ -649,7 +649,7 @@ kernel void kernel_mul_mm(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 2048*sizeof(S0));
 
     constexpr int NR0 = 64;
     constexpr int NR1 = 32;
@@ -920,7 +920,7 @@ kernel void kernel_mul_mm_id(
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     threadgroup S0 * sa = (threadgroup S0 *)shmem;
-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 2048*sizeof(S0));
     constexpr int NR0 = 64;
     constexpr int NR1 = 32;
     constexpr int NK = 32;
@@ -1008,6 +1008,22 @@ template [[host_name("mul_mm_id_q2_K")]] kernel dsm_mul_mm_id_t kernel_mul_mm_id
 template [[host_name("mul_mm_id_q3_K")]] kernel dsm_mul_mm_id_t kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q3_K, QK_NL, dequantize_q3_K, float, float4x4, float, float2x4>;
 template [[host_name("mul_mm_id_q4_K")]] kernel dsm_mul_mm_id_t kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
 template [[host_name("mul_mm_id_q6_K")]] kernel dsm_mul_mm_id_t kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
+typedef decltype(kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) dsm_mul_mm_f32_t;
+typedef decltype(kernel_mul_mm_id<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) dsm_mul_mm_id_f32_t;
+
+// FP32-staged variants (weights and activations kept in float in threadgroup
+// memory, 12 KiB). Used by the qwen35 hybrid prefill, whose MoE routing and
+// recurrent DeltaNet state amplify half-precision staging noise.
+template [[host_name("mul_mm_q8_0_f32")]] kernel dsm_mul_mm_f32_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
+template [[host_name("mul_mm_id_q8_0_f32")]] kernel dsm_mul_mm_id_f32_t kernel_mul_mm_id<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
+template [[host_name("mul_mm_q2_K_f32")]] kernel dsm_mul_mm_f32_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>;
+template [[host_name("mul_mm_id_q2_K_f32")]] kernel dsm_mul_mm_id_f32_t kernel_mul_mm_id<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>;
+template [[host_name("mul_mm_q3_K_f32")]] kernel dsm_mul_mm_f32_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q3_K, QK_NL, dequantize_q3_K, float, float4x4, float, float2x4>;
+template [[host_name("mul_mm_id_q3_K_f32")]] kernel dsm_mul_mm_id_f32_t kernel_mul_mm_id<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q3_K, QK_NL, dequantize_q3_K, float, float4x4, float, float2x4>;
+template [[host_name("mul_mm_q4_K_f32")]] kernel dsm_mul_mm_f32_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
+template [[host_name("mul_mm_id_q4_K_f32")]] kernel dsm_mul_mm_id_f32_t kernel_mul_mm_id<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
+template [[host_name("mul_mm_q6_K_f32")]] kernel dsm_mul_mm_f32_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
+template [[host_name("mul_mm_id_q6_K_f32")]] kernel dsm_mul_mm_id_f32_t kernel_mul_mm_id<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
 
 kernel void rmsnorm(device const float *x [[buffer(0)]], device const float *w [[buffer(1)]],
                     device float *out [[buffer(2)]], constant Norm &p [[buffer(3)]],
