@@ -407,6 +407,38 @@ Size: M, once Steps 0-3 exist.
 - Gate: same `check-ref` / `check-prefill` set on the 27B. Memory: 19 GB +
   state, which fits in 40 GB.
 
+### Result 5 (2026-11-09)
+
+Model: ggml-org `Qwen3.8-27B-Q4_K_M.gguf` (19,403,684,480 B; 851 tensors,
+48 DeltaNet + 16 attention layers; Q4_K FFN and token_embd, Q8_0
+attention/DeltaNet projections and output, F32 norms and ssm vectors).
+Commits: `4931846` dense FFN decode, `819c003` dense FFN batched prefill,
+`d2c69d5` keeps F32 alpha/beta on the row GEMV path (the 27B stores them as
+Q8_0 and goes through `encode_matmul`).
+
+| Gate | Result |
+|---|---|
+| `gguf-inspect --layers` | 851 mapped, 0 unknown, 48 DeltaNet, 16 attention |
+| `check-ref` vs llama Metal, "The capital of France is" | KL median 6.3e-5, max 1.2e-4, top-1 5/5, top-5 100% PASS |
+| `check-ref`, "def fibonacci(n):" | KL median 4.0e-5, max 4.7e-5, top-1 4/4 PASS |
+| greedy 32 tokens, both prompts | identical to `llama-ref --greedy 32`; two runs identical |
+| `check-prefill` P570, chunk 512 | max_abs 1.2e-3, KL 8.1e-11, top-5 same, greedy 64 same |
+| `check-prefill --n 33`, chunk 7 | exact (max_abs 0) |
+| `check-prefill --n 300 --split 100` | max_abs 1.2e-3, KL 6.0e-11 |
+| `check-rewind` (19-token prompt) | KL 3.2e-12, greedy 32 same, stale invalidated |
+| qwen3 unchanged | 1.7B Q4_K_M 0.010843754/1.18e-9; 30B-asym 0.53684092/5.48e-7 |
+
+Speed (570-token P, best of 2) vs `llama-bench -p 512 -n 128 -fa 1 -r 2`:
+
+| | DSM | llama.cpp |
+|---|---|---|
+| prefill, token loop (`DSM_HYBRID_PREFILL=0`) | 11.7 tok/s | |
+| prefill, batched | 100.9 tok/s | 125.5 (pp512) |
+| decode | 11.3 tok/s (short prompt 11.5) | 11.5 (tg128) |
+
+The dense model is weight-bandwidth bound in decode (≈15 GB read per token),
+so DSM and llama.cpp are at parity; prefill is 80% of llama.cpp.
+
 ## Step 6 (optional): Q5_K for UD-Q4_K_M (`ffn_down_exps` Q5_K)
 
 Size: M.
