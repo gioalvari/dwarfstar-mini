@@ -486,6 +486,7 @@ uint32_t dsm_metal_pos(const dsm_metal *s){return s->pos;}
 int dsm_metal_checkpoint(dsm_metal *s) {
     if (!s || !qwen35_arch(s->m)) return s != NULL;
     if (!checkpoint_buffers(s)) return 0;
+    double started = CFAbsoluteTimeGetCurrent();
     recurrent_checkpoint *checkpoint = &s->checkpoints[s->checkpoint_next];
     id<MTLCommandBuffer> cb = [s->queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
@@ -498,6 +499,9 @@ int dsm_metal_checkpoint(dsm_metal *s) {
     checkpoint->pos = s->pos;
     checkpoint->valid = 1;
     s->checkpoint_next = (s->checkpoint_next + 1) % s->checkpoint_count;
+    if (getenv("DSM_CKPT_PROFILE")) fprintf(stderr, "dsm: checkpoint %u %.2f MiB %.3f ms\n",
+        s->pos, (s->conv_state.length + s->ssm_state.length) / (1024.0 * 1024.0),
+        (CFAbsoluteTimeGetCurrent() - started) * 1000.0);
     return 1;
 }
 uint32_t dsm_metal_rewind(dsm_metal *s, uint32_t pos) {
