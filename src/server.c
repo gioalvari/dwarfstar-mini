@@ -98,12 +98,12 @@ int dsm_server_parse_tool_calls(const char *output, char **content, dsm_tool_cal
 bad: free(text.data); free(*content); *content = NULL; dsm_tool_calls_free(*calls, *count); *calls = NULL; *count = 0; return 0;
 }
 static size_t common_prefix(const int32_t *a, size_t an, const int32_t *b, size_t bn) { size_t n = an < bn ? an : bn, i = 0; while (i < n && a[i] == b[i]) ++i; return i; }
-static size_t checkpoint_split(const int32_t *tokens, size_t len, size_t start) {
+static size_t checkpoint_split(const int32_t *tokens, size_t len, size_t start,
+                               int32_t im_start) {
     /* Reasoning stripping commonly diverges in the assistant header. Checkpoint
        immediately before its final im_start token, falling back to len - 1 so
        a fully reused prompt can re-evaluate its last token from a saved state. */
-    const int32_t im_start = 248045;
-    for (size_t i = len; i-- > start;) if (tokens[i] == im_start) return i;
+    if (im_start >= 0) for (size_t i = len; i-- > start;) if (tokens[i] == im_start) return i;
     return len > start ? len - 1 : start;
 }
 static int cache_tokens(server *s, const dsm_tokens *tokens, const int32_t *generated, size_t generated_len) { size_t n = tokens->len + generated_len; if (n > s->cached_cap) { int32_t *cache = realloc(s->cached, n * sizeof(*cache)); if (!cache) return 0; s->cached = cache; s->cached_cap = n; } memcpy(s->cached, tokens->ids, tokens->len * sizeof(*s->cached)); if (generated_len) memcpy(s->cached + tokens->len, generated, generated_len * sizeof(*s->cached)); s->cached_len = n; return 1; }
@@ -122,6 +122,7 @@ static int generate(server *s, int fd, const dsm_json *root) {
        token. Re-evaluate that prompt token when the entire prompt is reused. */
     if (reused == tokens.len && reused) --reused;
     size_t requested_reuse = reused;
+    int recurrent = s->model.is_recurrent != NULL;
     if (s->use_metal) {
         uint32_t restored = dsm_metal_rewind(s->metal, (uint32_t)reused);
         if (restored == UINT32_MAX) { error_response(fd, 500, "cache state error"); goto done; }
@@ -130,12 +131,15 @@ static int generate(server *s, int fd, const dsm_json *root) {
     if (!s->use_metal && !dsm_forward_truncate(s->forward, (uint32_t)reused)) { error_response(fd, 500, "cache state error"); goto done; }
     fprintf(stderr, "dsm: received prompt tokens %zu, reuse requested %zu, restored %zu\n", tokens.len, requested_reuse, reused);
     double prefill_started = now();
-    if (s->use_metal) {
-        size_t split = checkpoint_split(tokens.ids, tokens.len, reused);
+    if (s->use_metal && recurrent) {
+        size_t split = checkpoint_split(tokens.ids, tokens.len, reused,
+                                        dsm_token_im_start(s->tokenizer));
         if (reused < split && !dsm_metal_prefill(s->metal, tokens.ids + reused, (uint32_t)(split - reused), s->logits)) { error_response(fd, 500, "prompt inference failed"); goto done; }
         if (reused < split && !dsm_metal_checkpoint(s->metal)) { error_response(fd, 500, "checkpoint failed"); goto done; }
         if (split < tokens.len && !dsm_metal_prefill(s->metal, tokens.ids + split, (uint32_t)(tokens.len - split), s->logits)) { error_response(fd, 500, "prompt inference failed"); goto done; }
         if (!dsm_metal_checkpoint(s->metal)) { error_response(fd, 500, "checkpoint failed"); goto done; }
+    } else if (s->use_metal) {
+        if (reused < tokens.len && !dsm_metal_prefill(s->metal, tokens.ids + reused, (uint32_t)(tokens.len - reused), s->logits)) { error_response(fd, 500, "prompt inference failed"); goto done; }
     } else for (size_t i = reused; i < tokens.len; ++i) if (!dsm_forward_token(s->forward, tokens.ids[i], s->logits)) { error_response(fd, 500, "prompt inference failed"); goto done; }
     double prefill_elapsed = now() - prefill_started;
     char request_id[64]; snprintf(request_id, sizeof(request_id), "chatcmpl-%lx", (unsigned long)time(NULL)); if (stream && !send_all(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n", 91)) goto done;
