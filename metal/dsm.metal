@@ -1123,11 +1123,13 @@ kernel void ssm_conv_batch(device const float *input [[buffer(0)]],
 }
 
 kernel void split_gdn_qk_batch(device const float *input [[buffer(0)]],
-                               device float *q [[buffer(1)]],
-                               device float *k [[buffer(2)]],
-                               constant uint &qk_width [[buffer(3)]],
-                               constant uint &mixed_width [[buffer(4)]],
-                               uint index [[thread_position_in_grid]]) {
+                                device float *q [[buffer(1)]],
+                                device float *k [[buffer(2)]],
+                                constant uint &qk_width [[buffer(3)]],
+                                constant uint &mixed_width [[buffer(4)]],
+                                constant uint &n [[buffer(5)]],
+                                uint index [[thread_position_in_grid]]) {
+    if (index >= n) return;
     uint row = index / qk_width, column = index % qk_width;
     q[index] = input[row * mixed_width + column];
     k[index] = input[row * mixed_width + qk_width + column];

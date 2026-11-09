@@ -13,6 +13,29 @@ static int matmul_supported(uint32_t type) {
            type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ||
            type == GGML_TYPE_Q6_K;
 }
+static int qwen35_arch(const dsm_model *model) {
+    return model->arch == DSM_ARCH_QWEN35 || model->arch == DSM_ARCH_QWEN35MOE;
+}
+static void check_hybrid_kernels(dsm_metal *metal) {
+    const uint32_t rows[] = {1, 2, 3, 7, 33};
+    for (uint32_t i = 0; i < sizeof(rows) / sizeof(*rows); ++i) {
+        for (int nonzero_state = 0; nonzero_state <= 1; ++nonzero_state) {
+            float max_abs, max_rel;
+            if (dsm_metal_hybrid_kernels_test(metal, 0, rows[i], nonzero_state,
+                                              &max_abs, &max_rel)) {
+                fprintf(stderr, "hybrid kernels rows=%u nonzero_state=%d failed\n",
+                        rows[i], nonzero_state);
+                exit(1);
+            }
+            printf("hybrid kernels rows=%u nonzero_state=%d max_abs=%.8g max_rel=%.8g\n",
+                   rows[i], nonzero_state, max_abs, max_rel);
+            if (!(max_rel <= 1e-5f)) {
+                fprintf(stderr, "hybrid kernels relative error exceeded 1e-5\n");
+                exit(1);
+            }
+        }
+    }
+}
 static void check(dsm_metal *metal, const gguf_tensor *weights) {
     uint64_t in = weights->dims[0], out = weights->dims[1]; float *x = malloc(in * sizeof(*x)), *cpu = malloc(out * sizeof(*cpu)), *gpu = malloc(out * sizeof(*gpu)); uint32_t state = 1;
     for (uint64_t i = 0; i < in; ++i) x[i] = random_value(&state);
@@ -139,6 +162,7 @@ int main(int argc, char **argv) {
         if (!tensor || !*argv[3] || *end || id > UINT32_MAX) { fprintf(stderr, "invalid tensor or expert id\n"); dsm_metal_free(metal); dsm_model_close(&model); return 2; }
         check_expert(metal, tensor, (uint32_t)id);
     } else {
+        if (qwen35_arch(&model)) check_hybrid_kernels(metal);
         uint32_t seen[64] = {0}; const gguf_tensor *must[] = {model.token_embd, model.output, model.layer[0].down};
         for (unsigned i = 0; i < sizeof(must) / sizeof(*must); ++i) if (must[i] && !seen[must[i]->type]) { check(metal, must[i]); seen[must[i]->type] = 1; }
         for (uint64_t i = 0; i < model.gguf.n_tensors; ++i) { const gguf_tensor *tensor = &model.gguf.tensors[i]; if (tensor->ndim == 2 && dsm_quant_supported(tensor->type) && !seen[tensor->type]) { check(metal, tensor); seen[tensor->type] = 1; } }
