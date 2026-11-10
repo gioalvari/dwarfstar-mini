@@ -13,6 +13,34 @@ static int matmul_supported(uint32_t type) {
            type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ||
            type == GGML_TYPE_Q6_K;
 }
+static void check_f32_matmul(dsm_metal *metal, const gguf_tensor *weights,
+                             const char *name) {
+    static const uint32_t rows[] = {9, 33, 512};
+    uint64_t in = weights->dims[0], out = weights->dims[1];
+    for (uint32_t r = 0; r < sizeof(rows) / sizeof(*rows); ++r) {
+        float *x = malloc((size_t)rows[r] * in * sizeof(*x));
+        float *gemv = malloc((size_t)rows[r] * out * sizeof(*gemv));
+        float *mm = malloc((size_t)rows[r] * out * sizeof(*mm));
+        uint32_t state = 1;
+        if (!x || !gemv || !mm) { fprintf(stderr, "out of memory\n"); exit(1); }
+        for (uint64_t i = 0; i < (uint64_t)rows[r] * in; ++i) x[i] = random_value(&state);
+        for (uint32_t row = 0; row < rows[r]; ++row) {
+            if (!dsm_metal_matvec_test(metal, weights, x + (uint64_t)row * in,
+                                       gemv + (uint64_t)row * out)) exit(1);
+        }
+        if (!dsm_metal_matmul_test(metal, weights, x, rows[r], mm)) exit(1);
+        double error_sq = 0, reference_sq = 0;
+        for (uint64_t i = 0; i < (uint64_t)rows[r] * out; ++i) {
+            double error = gemv[i] - mm[i];
+            error_sq += error * error;
+            reference_sq += (double)gemv[i] * gemv[i];
+        }
+        float rel = sqrtf((float)(error_sq / reference_sq));
+        printf("f32_mul_mm %-18s rows=%u rel_err=%.8g\n", name, rows[r], rel);
+        if (!(rel <= 2e-3f)) { fprintf(stderr, "f32 mul_mm relative error exceeded 2e-3\n"); exit(1); }
+        free(x); free(gemv); free(mm);
+    }
+}
 static int qwen35_arch(const dsm_model *model) {
     return model->arch == DSM_ARCH_QWEN35 || model->arch == DSM_ARCH_QWEN35MOE;
 }
@@ -162,7 +190,13 @@ int main(int argc, char **argv) {
         if (!tensor || !*argv[3] || *end || id > UINT32_MAX) { fprintf(stderr, "invalid tensor or expert id\n"); dsm_metal_free(metal); dsm_model_close(&model); return 2; }
         check_expert(metal, tensor, (uint32_t)id);
     } else {
-        if (qwen35_arch(&model)) check_hybrid_kernels(metal);
+        if (qwen35_arch(&model)) {
+            check_hybrid_kernels(metal);
+            if (model.is_moe) {
+                check_f32_matmul(metal, model.layer[0].gate_inp, "router");
+                check_f32_matmul(metal, model.layer[0].alpha, "alpha");
+            }
+        }
         uint32_t seen[64] = {0}; const gguf_tensor *must[] = {model.token_embd, model.output, model.layer[0].down};
         for (unsigned i = 0; i < sizeof(must) / sizeof(*must); ++i) if (must[i] && !seen[must[i]->type]) { check(metal, must[i]); seen[must[i]->type] = 1; }
         for (uint64_t i = 0; i < model.gguf.n_tensors; ++i) { const gguf_tensor *tensor = &model.gguf.tensors[i]; if (tensor->ndim == 2 && dsm_quant_supported(tensor->type) && !seen[tensor->type]) { check(metal, tensor); seen[tensor->type] = 1; } }

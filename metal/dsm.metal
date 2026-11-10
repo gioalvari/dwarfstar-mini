@@ -1024,6 +1024,7 @@ template [[host_name("mul_mm_q4_K_f32")]] kernel dsm_mul_mm_f32_t kernel_mul_mm<
 template [[host_name("mul_mm_id_q4_K_f32")]] kernel dsm_mul_mm_id_f32_t kernel_mul_mm_id<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
 template [[host_name("mul_mm_q6_K_f32")]] kernel dsm_mul_mm_f32_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
 template [[host_name("mul_mm_id_q6_K_f32")]] kernel dsm_mul_mm_id_f32_t kernel_mul_mm_id<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
+template [[host_name("mul_mm_f32w_f32")]] kernel dsm_mul_mm_f32_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>;
 
 kernel void rmsnorm(device const float *x [[buffer(0)]], device const float *w [[buffer(1)]],
                     device float *out [[buffer(2)]], constant Norm &p [[buffer(3)]],
