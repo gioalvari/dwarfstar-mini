@@ -278,7 +278,7 @@ static int encode_expert_matmul(dsm_metal *s, id<MTLComputeCommandEncoder> e,
                                 const gguf_tensor *w, id<MTLBuffer> x,
                                 id<MTLBuffer> y, uint32_t rows,
                                 uint32_t input_rows, uint32_t input_stride,
-                                uint32_t output_stride);
+                                uint32_t output_stride, int build_map);
 static void encode_attention_decode(dsm_metal *s,
                                     id<MTLComputeCommandEncoder> e,
                                     uint32_t layer, uint32_t pos);
@@ -663,7 +663,7 @@ int dsm_metal_expert_matmul_test(dsm_metal *s, const gguf_tensor *w,
     id<MTLCommandBuffer> cb = [s->queue commandBuffer];
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
     if (!encode_expert_matmul(s, e, w, x, y, rows, input_rows, (uint32_t)w->dims[0],
-                              (uint32_t)w->dims[1])) return 0;
+                              (uint32_t)w->dims[1], 1)) return 0;
     [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
     if (cb.status != MTLCommandBufferStatusCompleted) return 0;
     memcpy(output, y.contents,
@@ -1113,7 +1113,7 @@ static int encode_expert_matmul(dsm_metal *s, id<MTLComputeCommandEncoder> e,
                                 const gguf_tensor *w, id<MTLBuffer> x,
                                 id<MTLBuffer> y, uint32_t rows,
                                 uint32_t input_rows, uint32_t input_stride,
-                                uint32_t output_stride) {
+                                uint32_t output_stride, int build_map) {
     const dsm_model *m = s->m;
     (void)output_stride;
     id<MTLComputePipelineState> p = rows > 8 && w->dims[0] % 32 == 0
@@ -1129,8 +1129,9 @@ static int encode_expert_matmul(dsm_metal *s, id<MTLComputeCommandEncoder> e,
         .ne21 = (int32_t)rows, .ne20 = (int32_t)m->experts_used,
         .nb21 = m->experts_used * sizeof(uint32_t),
     };
-    static int map0_mode = -1; if (map0_mode < 0) map0_mode = getenv("DSM_MAP0") ? atoi(getenv("DSM_MAP0")) : 1;
-    extern int dsm_map0_skip, dsm_map0_only; if (!map0_mode || dsm_map0_skip) goto skip_map0;
+    /* The token->expert tile map depends only on the routing ids, so callers
+       build it once per layer and reuse it for gate, up and down. */
+    if (!build_map) goto skip_map0;
     [e setComputePipelineState:s->mm_id_map0];
     [e setBytes:&map length:sizeof(map) atIndex:0];
     [e setBuffer:s->bids offset:0 atIndex:1];
@@ -1139,7 +1140,6 @@ static int encode_expert_matmul(dsm_metal *s, id<MTLComputeCommandEncoder> e,
     [e setThreadgroupMemoryLength:(NSUInteger)(2 * m->experts * sizeof(uint32_t)) atIndex:0];
     [e dispatchThreadgroups:MTLSizeMake(1, 1, 1)
  threadsPerThreadgroup:MTLSizeMake(m->experts, 1, 1)];
-    if (dsm_map0_only) return 1;
 skip_map0:;
     mul_mm_id_params args = {
         .ne00 = (int32_t)w->dims[0], .ne02 = (int32_t)m->experts,
@@ -1244,13 +1244,13 @@ static void encode_layer_batch(dsm_metal *s, id<MTLComputeCommandEncoder> e,
         encode_moe_topk_batch(s, e, rows);
         int use_mm_id = mul_mm_id_enabled() && rows > 8 &&
                         encode_expert_matmul(s, e, w->gate_exps, s->bnorm, s->bgate,
-                                             rows, 1, m->dim, m->expert_hidden) &&
+                                             rows, 1, m->dim, m->expert_hidden, 1) &&
                         encode_expert_matmul(s, e, w->up_exps, s->bnorm, s->bup,
-                                             rows, 1, m->dim, m->expert_hidden);
+                                             rows, 1, m->dim, m->expert_hidden, 0);
         if (use_mm_id) {
             [e setComputePipelineState:s->expert_swiglu]; [e setBuffer:s->bgate offset:0 atIndex:0]; [e setBuffer:s->bup offset:0 atIndex:1]; [e setBytes:&m->expert_hidden length:sizeof(m->expert_hidden) atIndex:2]; [e setBytes:&m->experts_used length:sizeof(m->experts_used) atIndex:3]; [e setBytes:&rows length:sizeof(rows) atIndex:4]; dispatch_1d(e, s->expert_swiglu, rows * m->expert_hidden * m->experts_used);
             use_mm_id = encode_expert_matmul(s, e, w->down_exps, s->bgate, s->btmp,
-                                              rows, m->experts_used, m->expert_hidden, m->dim);
+                                              rows, m->experts_used, m->expert_hidden, m->dim, 0);
         }
         if (!use_mm_id) {
             for (uint32_t row = 0; row < rows; ++row) {
@@ -1271,7 +1271,6 @@ static void encode_layer_batch(dsm_metal *s, id<MTLComputeCommandEncoder> e,
    1 norm+mixer in-proj, 2 mixer elementwise (conv/l2/gates/gnorm | split/norm/rope/cache/sigmoid),
    3 out-proj+add+ffn_norm, 4 router+topk, 5 routed experts+moe_add, 6 shared expert / dense FFN,
    7 gdn recurrence, 8 attention row loop */
-int dsm_map0_skip, dsm_map0_only;
 static int dbg_stage;
 double dsm_stage_gpu[9][2];
 #define ST(n) (dbg_stage == 0 || dbg_stage == (n))
@@ -1285,15 +1284,13 @@ static void encode_hybrid_moe_batch(dsm_metal *s, id<MTLComputeCommandEncoder> e
     encode_moe_topk_batch(s, e, rows); }
     if (ST(5)) {
     static int parts = -1; if (parts < 0) parts = getenv("DSM_EXP_PARTS") ? atoi(getenv("DSM_EXP_PARTS")) : 31;
-    static int once = -1; if (once < 0) once = getenv("DSM_MAP0_ONCE") != NULL;
     int use_mm_id = mul_mm_id_enabled() && rows > 8;
     static int dup = -1; if (dup < 0) dup = getenv("DSM_EXP_DUP") ? atoi(getenv("DSM_EXP_DUP")) : 0;
-    if (use_mm_id && (parts & 1)) use_mm_id = encode_expert_matmul(s, e, w->gate_exps, s->bnorm, s->bgate, rows, 1, m->dim, m->expert_hidden);
-    if (use_mm_id && (dup & 1)) encode_expert_matmul(s, e, w->gate_exps, s->bnorm, s->bgate, rows, 1, m->dim, m->expert_hidden);
-    if (use_mm_id && (dup & 32)) { int sk = dsm_map0_skip; dsm_map0_skip = 0; dsm_map0_only = 1; encode_expert_matmul(s, e, w->gate_exps, s->bnorm, s->bgate, rows, 1, m->dim, m->expert_hidden); dsm_map0_only = 0; dsm_map0_skip = sk; }
-    if (once) dsm_map0_skip = 1;
-    if (use_mm_id && (parts & 2)) use_mm_id = encode_expert_matmul(s, e, w->up_exps, s->bnorm, s->bup, rows, 1, m->dim, m->expert_hidden);
-    if (use_mm_id && (dup & 2)) encode_expert_matmul(s, e, w->up_exps, s->bnorm, s->bup, rows, 1, m->dim, m->expert_hidden);
+    int map = 1;
+    if (use_mm_id && (parts & 1)) { use_mm_id = encode_expert_matmul(s, e, w->gate_exps, s->bnorm, s->bgate, rows, 1, m->dim, m->expert_hidden, map); map = 0; }
+    if (use_mm_id && (dup & 1)) encode_expert_matmul(s, e, w->gate_exps, s->bnorm, s->bgate, rows, 1, m->dim, m->expert_hidden, 0);
+    if (use_mm_id && (parts & 2)) { use_mm_id = encode_expert_matmul(s, e, w->up_exps, s->bnorm, s->bup, rows, 1, m->dim, m->expert_hidden, map); map = 0; }
+    if (use_mm_id && (dup & 2)) encode_expert_matmul(s, e, w->up_exps, s->bnorm, s->bup, rows, 1, m->dim, m->expert_hidden, 0);
     if (use_mm_id && (parts & 4)) {
         [e setComputePipelineState:s->expert_swiglu];
         [e setBuffer:s->bgate offset:0 atIndex:0]; [e setBuffer:s->bup offset:0 atIndex:1];
@@ -1304,9 +1301,8 @@ static void encode_hybrid_moe_batch(dsm_metal *s, id<MTLComputeCommandEncoder> e
     }
     if (use_mm_id && (parts & 8)) use_mm_id = encode_expert_matmul(s, e, w->down_exps, s->bgate, s->btmp,
                                          rows, m->experts_used, m->expert_hidden,
-                                         m->dim);
-    if (use_mm_id && (dup & 8)) encode_expert_matmul(s, e, w->down_exps, s->bgate, s->btmp, rows, m->experts_used, m->expert_hidden, m->dim);
-    dsm_map0_skip = 0;
+                                         m->dim, map);
+    if (use_mm_id && (dup & 8)) encode_expert_matmul(s, e, w->down_exps, s->bgate, s->btmp, rows, m->experts_used, m->expert_hidden, m->dim, 0);
     if (!(parts & 16)) return;
     if (!use_mm_id) for (uint32_t row = 0; row < rows; ++row) {
         NSUInteger x_off = (NSUInteger)row * m->dim * sizeof(float);
