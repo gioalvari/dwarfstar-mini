@@ -127,8 +127,9 @@ static void set_checked(id<MTLComputeCommandEncoder> e, id<MTLBuffer> b,
 static uint32_t prefill_chunk_size(const dsm_model *m) {
     const char *value = getenv("DSM_PREFILL_CHUNK");
     char *end = NULL;
-    unsigned long chunk = value ? strtoul(value, &end, 10) : 512;
-    if (!value || !*value || *end || !chunk || chunk > UINT32_MAX) chunk = 512;
+    unsigned long chunk = value ? strtoul(value, &end, 10) : 1024;
+    if (!value || !*value || *end || !chunk || chunk > UINT32_MAX) chunk = 1024;
+    if (!m->is_moe && m->hidden > 16384 && chunk > 512) chunk = 512;
     if (chunk > m->context) chunk = m->context;
     return (uint32_t)chunk;
 }
