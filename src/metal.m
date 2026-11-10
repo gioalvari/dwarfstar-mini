@@ -37,6 +37,7 @@ typedef struct { uint32_t heads, kv_heads, dim, pos0, context, layer, rows; } at
 typedef struct { uint32_t in, out, rows, x_stride, y_stride; } gemv_rows_params;
 typedef struct { uint32_t in, out, expert_stride, out_stride, input_stride; } expert_gemv_params;
 typedef struct { uint32_t heads, dim, rot, pos; float base; } rope_partial_params;
+typedef struct { uint32_t heads, dim, rot, pos0, rows; float base; } rope_partial_batch_params;
 typedef struct { uint32_t width, history; } ssm_conv_params;
 typedef struct { uint32_t qk_heads, v_heads, state_dim, layer; float eps; } gdn_params;
 typedef struct { uint32_t width, history, rows; } ssm_conv_batch_params;
@@ -80,7 +81,7 @@ struct dsm_metal {
     id<MTLComputePipelineState> q8, q2k, q3k, q4k, q5k, q6k, f32, norm, rope, rope_partial, cache, attention, attention_split, attention_merge, add, swiglu, route_topk, expert_q8, expert_q8_fast, expert_q3k, expert_q4k, expert_q6k, expert_swiglu, moe_add;
     id<MTLComputePipelineState> split_q_gate, split_gdn_qk, l2norm, ssm_conv, gdn_gates, gdn, gated_rmsnorm, sigmoid_mul, shexp_add, f32_rows, shexp_add_batch;
     id<MTLComputePipelineState> ssm_conv_batch, split_gdn_qk_batch, gdn_gates_batch, gdn_batch;
-    id<MTLComputePipelineState> rope_batch, cache_batch, attention_prefill, moe_add_batch;
+    id<MTLComputePipelineState> rope_batch, rope_partial_batch, cache_batch, attention_prefill, moe_add_batch;
     id<MTLComputePipelineState> mm_q8, mm_q2k, mm_q3k, mm_q4k, mm_q6k, mm_id_map0, mm_id_q8, mm_id_q2k, mm_id_q3k, mm_id_q4k, mm_id_q6k;
     /* FP32-staged mul_mm/mul_mm_id, indexed q8_0,q2_K,q3_K,q4_K,q6_K; used when mm_f32. */
     id<MTLComputePipelineState> mmf[5], mmf_id[5];
@@ -524,7 +525,7 @@ int dsm_metal_init(dsm_metal **out,const dsm_model *m,uint32_t context,char *err
         set_error(error, error_size, "Metal route_topk supports at most 256 experts"); goto bad;
     }
     s->q8=pipeline(s->device,lib,@"q8_gemv",error,error_size);s->q2k=pipeline(s->device,lib,@"q2k_gemv",error,error_size);s->q3k=pipeline(s->device,lib,@"q3k_gemv",error,error_size);s->q4k=pipeline(s->device,lib,@"q4k_gemv",error,error_size);s->q5k=pipeline(s->device,lib,@"q5k_gemv",error,error_size);s->q6k=pipeline(s->device,lib,@"q6k_gemv",error,error_size);s->f32=pipeline(s->device,lib,@"f32_gemv",error,error_size);s->norm=pipeline(s->device,lib,@"rmsnorm",error,error_size);s->rope=pipeline(s->device,lib,@"rope_neox",error,error_size);s->rope_partial=pipeline(s->device,lib,@"rope_neox_partial",error,error_size);s->split_q_gate=pipeline(s->device,lib,@"split_q_gate",error,error_size);s->split_gdn_qk=pipeline(s->device,lib,@"split_gdn_qk",error,error_size);s->l2norm=pipeline(s->device,lib,@"l2norm_heads",error,error_size);s->ssm_conv=pipeline(s->device,lib,@"ssm_conv_step",error,error_size);s->gdn_gates=pipeline(s->device,lib,@"gdn_gates",error,error_size);s->gdn=pipeline(s->device,lib,@"gated_delta_net",error,error_size);s->gated_rmsnorm=pipeline(s->device,lib,@"gated_rmsnorm_silu",error,error_size);s->sigmoid_mul=pipeline(s->device,lib,@"sigmoid_mul",error,error_size);s->shexp_add=pipeline(s->device,lib,@"shexp_add",error,error_size);s->ssm_conv_batch=pipeline(s->device,lib,@"ssm_conv_batch",error,error_size);s->split_gdn_qk_batch=pipeline(s->device,lib,@"split_gdn_qk_batch",error,error_size);s->gdn_gates_batch=pipeline(s->device,lib,@"gdn_gates_batch",error,error_size);s->gdn_batch=pipeline(s->device,lib,@"gated_delta_net_batch",error,error_size);s->cache=pipeline(s->device,lib,@"cache_write",error,error_size);s->attention=pipeline(s->device,lib,@"attention_decode",error,error_size);s->attention_split=pipeline(s->device,lib,@"attention_decode_split",error,error_size);s->attention_merge=pipeline(s->device,lib,@"attention_decode_merge",error,error_size);s->add=pipeline(s->device,lib,@"add_inplace",error,error_size);s->swiglu=pipeline(s->device,lib,@"swiglu",error,error_size);s->route_topk=pipeline(s->device,lib,@"route_topk",error,error_size);s->expert_q8=pipeline(s->device,lib,@"expert_q8_0_gemv",error,error_size);s->expert_q8_fast=pipeline(s->device,lib,@"expert_q8_0_gemv_fast",error,error_size);s->expert_q3k=pipeline(s->device,lib,@"expert_q3k_gemv",error,error_size);s->expert_q4k=pipeline(s->device,lib,@"expert_q4k_gemv",error,error_size);s->expert_q6k=pipeline(s->device,lib,@"expert_q6k_gemv",error,error_size);s->expert_swiglu=pipeline(s->device,lib,@"expert_swiglu",error,error_size);s->moe_add=pipeline(s->device,lib,@"moe_add",error,error_size);if(!s->q8||!s->q2k||!s->q3k||!s->q4k||!s->q5k||!s->q6k||!s->f32||!s->norm||!s->rope||!s->rope_partial||!s->split_q_gate||!s->split_gdn_qk||!s->l2norm||!s->ssm_conv||!s->gdn_gates||!s->gdn||!s->gated_rmsnorm||!s->sigmoid_mul||!s->shexp_add||!s->ssm_conv_batch||!s->split_gdn_qk_batch||!s->gdn_gates_batch||!s->gdn_batch||!s->cache||!s->attention||!s->attention_split||!s->attention_merge||!s->add||!s->swiglu||!s->route_topk||!s->expert_q8||!s->expert_q8_fast||!s->expert_q3k||!s->expert_q4k||!s->expert_q6k||!s->expert_swiglu||!s->moe_add)goto bad;
-    s->rope_batch=pipeline(s->device,lib,@"rope_neox_batch",error,error_size);s->cache_batch=pipeline(s->device,lib,@"cache_write_batch",error,error_size);s->attention_prefill=pipeline(s->device,lib,@"attention_prefill",error,error_size);s->moe_add_batch=pipeline(s->device,lib,@"moe_add_batch",error,error_size);s->mm_q8=pipeline(s->device,lib,@"mul_mm_q8_0",error,error_size);s->mm_q2k=pipeline(s->device,lib,@"mul_mm_q2_K",error,error_size);s->mm_q3k=pipeline(s->device,lib,@"mul_mm_q3_K",error,error_size);s->mm_q4k=pipeline(s->device,lib,@"mul_mm_q4_K",error,error_size);s->mm_q6k=pipeline(s->device,lib,@"mul_mm_q6_K",error,error_size);s->mm_id_map0=pipeline(s->device,lib,@"mul_mm_id_map0",error,error_size);s->mm_id_q8=pipeline(s->device,lib,@"mul_mm_id_q8_0",error,error_size);s->mm_id_q2k=pipeline(s->device,lib,@"mul_mm_id_q2_K",error,error_size);s->mm_id_q3k=pipeline(s->device,lib,@"mul_mm_id_q3_K",error,error_size);s->mm_id_q4k=pipeline(s->device,lib,@"mul_mm_id_q4_K",error,error_size);s->mm_id_q6k=pipeline(s->device,lib,@"mul_mm_id_q6_K",error,error_size);{static NSString *const mmf_names[5]={@"q8_0",@"q2_K",@"q3_K",@"q4_K",@"q6_K"};for(int i=0;i<5;++i){s->mmf[i]=pipeline(s->device,lib,[NSString stringWithFormat:@"mul_mm_%@_f32",mmf_names[i]],error,error_size);s->mmf_id[i]=pipeline(s->device,lib,[NSString stringWithFormat:@"mul_mm_id_%@_f32",mmf_names[i]],error,error_size);if(!s->mmf[i]||!s->mmf_id[i])goto bad;}const char *mmf_env=getenv("DSM_MM_F32");s->mm_f32=mmf_env?strcmp(mmf_env,"0")!=0:qwen35_arch(m);}if(!s->rope_batch||!s->cache_batch||!s->attention_prefill||!s->moe_add_batch||!s->mm_q8||!s->mm_q2k||!s->mm_q3k||!s->mm_q4k||!s->mm_q6k||!s->mm_id_map0||!s->mm_id_q8||!s->mm_id_q2k||!s->mm_id_q3k||!s->mm_id_q4k||!s->mm_id_q6k)goto bad;
+    s->rope_batch=pipeline(s->device,lib,@"rope_neox_batch",error,error_size);s->rope_partial_batch=pipeline(s->device,lib,@"rope_neox_partial_batch",error,error_size);s->cache_batch=pipeline(s->device,lib,@"cache_write_batch",error,error_size);s->attention_prefill=pipeline(s->device,lib,@"attention_prefill",error,error_size);s->moe_add_batch=pipeline(s->device,lib,@"moe_add_batch",error,error_size);s->mm_q8=pipeline(s->device,lib,@"mul_mm_q8_0",error,error_size);s->mm_q2k=pipeline(s->device,lib,@"mul_mm_q2_K",error,error_size);s->mm_q3k=pipeline(s->device,lib,@"mul_mm_q3_K",error,error_size);s->mm_q4k=pipeline(s->device,lib,@"mul_mm_q4_K",error,error_size);s->mm_q6k=pipeline(s->device,lib,@"mul_mm_q6_K",error,error_size);s->mm_id_map0=pipeline(s->device,lib,@"mul_mm_id_map0",error,error_size);s->mm_id_q8=pipeline(s->device,lib,@"mul_mm_id_q8_0",error,error_size);s->mm_id_q2k=pipeline(s->device,lib,@"mul_mm_id_q2_K",error,error_size);s->mm_id_q3k=pipeline(s->device,lib,@"mul_mm_id_q3_K",error,error_size);s->mm_id_q4k=pipeline(s->device,lib,@"mul_mm_id_q4_K",error,error_size);s->mm_id_q6k=pipeline(s->device,lib,@"mul_mm_id_q6_K",error,error_size);{static NSString *const mmf_names[5]={@"q8_0",@"q2_K",@"q3_K",@"q4_K",@"q6_K"};for(int i=0;i<5;++i){s->mmf[i]=pipeline(s->device,lib,[NSString stringWithFormat:@"mul_mm_%@_f32",mmf_names[i]],error,error_size);s->mmf_id[i]=pipeline(s->device,lib,[NSString stringWithFormat:@"mul_mm_id_%@_f32",mmf_names[i]],error,error_size);if(!s->mmf[i]||!s->mmf_id[i])goto bad;}const char *mmf_env=getenv("DSM_MM_F32");s->mm_f32=mmf_env?strcmp(mmf_env,"0")!=0:qwen35_arch(m);}if(!s->rope_batch||!s->rope_partial_batch||!s->cache_batch||!s->attention_prefill||!s->moe_add_batch||!s->mm_q8||!s->mm_q2k||!s->mm_q3k||!s->mm_q4k||!s->mm_q6k||!s->mm_id_map0||!s->mm_id_q8||!s->mm_id_q2k||!s->mm_id_q3k||!s->mm_id_q4k||!s->mm_id_q6k)goto bad;
     s->f32_rows = pipeline(s->device, lib, @"f32_gemv_rows", error, error_size);
     s->mm_f32w = pipeline(s->device, lib, @"mul_mm_f32w_f32", error, error_size);
     s->shexp_add_batch = pipeline(s->device, lib, @"shexp_add_batch", error,
@@ -1376,19 +1377,25 @@ static void encode_layer_hybrid_batch(dsm_metal *s, id<MTLComputeCommandEncoder>
     } else {
         if (ST(1)) { encode_matmul(s, e, w->q, s->bnorm, s->hb_qg, rows); encode_matmul(s, e, w->k, s->bnorm, s->hb_ak, rows); encode_matmul(s, e, w->v, s->bnorm, s->hb_av, rows); }
         if (ST(2)) {
-        for (uint32_t row = 0; row < rows; ++row) { NSUInteger qg = (NSUInteger)row * 2 * m->q_width * sizeof(float), aq = (NSUInteger)row * m->q_width * sizeof(float); [e setComputePipelineState:s->split_q_gate]; set_checked(e, s->hb_qg, qg, (NSUInteger)2 * m->q_width * sizeof(float), 0); set_checked(e, s->hb_aq, aq, (NSUInteger)m->q_width * sizeof(float), 1); set_checked(e, s->hb_agate, aq, (NSUInteger)m->q_width * sizeof(float), 2); [e setBytes:&m->key_dim length:sizeof(m->key_dim) atIndex:3]; dispatch_1d(e, s->split_q_gate, m->q_width); }
+        { uint32_t n = rows * m->q_width;
+          [e setComputePipelineState:s->split_q_gate];
+          set_checked(e, s->hb_qg, 0, (NSUInteger)rows * 2 * m->q_width * sizeof(float), 0);
+          set_checked(e, s->hb_aq, 0, (NSUInteger)n * sizeof(float), 1);
+          set_checked(e, s->hb_agate, 0, (NSUInteger)n * sizeof(float), 2);
+          [e setBytes:&m->key_dim length:sizeof(m->key_dim) atIndex:3];
+          dispatch_1d(e, s->split_q_gate, n); }
         encode_norm_at(s, e, s->hb_aq, 0, w->q_norm, s->hb_aq, 0, m->key_dim, rows * m->heads); encode_norm_at(s, e, s->hb_ak, 0, w->k_norm, s->hb_ak, 0, m->key_dim, rows * m->kv_heads);
-        for (uint32_t row = 0; row < rows; ++row) {
-            NSUInteger qoff = (NSUInteger)row * m->q_width * sizeof(float);
-            NSUInteger koff = (NSUInteger)row * m->kv_heads * m->key_dim * sizeof(float);
-            NSUInteger moff = (NSUInteger)row * m->attn_width * sizeof(float);
-            rope_partial_params rope = {m->heads, m->key_dim, m->rope_dims,
-                                        pos0 + row, m->rope_base};
-            [e setComputePipelineState:s->rope_partial]; set_checked(e, s->hb_aq, qoff, (NSUInteger)m->q_width * sizeof(float), 0); [e setBytes:&rope length:sizeof(rope) atIndex:1]; dispatch_1d(e, s->rope_partial, m->heads * (m->rope_dims / 2));
-            rope.heads = m->kv_heads;
-            [e setComputePipelineState:s->rope_partial]; set_checked(e, s->hb_ak, koff, (NSUInteger)m->kv_heads * m->key_dim * sizeof(float), 0); [e setBytes:&rope length:sizeof(rope) atIndex:1]; dispatch_1d(e, s->rope_partial, m->kv_heads * (m->rope_dims / 2));
-            (void)moff;
-        }
+        rope_partial_batch_params rope = {m->heads, m->key_dim, m->rope_dims,
+                                          pos0, rows, m->rope_base};
+        [e setComputePipelineState:s->rope_partial_batch];
+        set_checked(e, s->hb_aq, 0, (NSUInteger)rows * m->q_width * sizeof(float), 0);
+        [e setBytes:&rope length:sizeof(rope) atIndex:1];
+        dispatch_1d(e, s->rope_partial_batch, rows * m->heads * (m->rope_dims / 2));
+        rope.heads = m->kv_heads;
+        [e setComputePipelineState:s->rope_partial_batch];
+        set_checked(e, s->hb_ak, 0, (NSUInteger)rows * m->kv_heads * m->key_dim * sizeof(float), 0);
+        [e setBytes:&rope length:sizeof(rope) atIndex:1];
+        dispatch_1d(e, s->rope_partial_batch, rows * m->kv_heads * (m->rope_dims / 2));
         cache_batch_params cache = {m->attn_index[layer], pos0, s->context,
                                     m->kv_heads * m->key_dim, rows};
         [e setComputePipelineState:s->cache_batch]; set_checked(e, s->hb_ak, 0, (NSUInteger)rows * cache.width * sizeof(float), 0); set_checked(e, s->keys, 0, s->keys.length, 1); [e setBytes:&cache length:sizeof(cache) atIndex:2]; dispatch_1d(e, s->cache_batch, rows * cache.width);

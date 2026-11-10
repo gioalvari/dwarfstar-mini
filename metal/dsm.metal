@@ -23,6 +23,7 @@ struct RopeBatch { uint heads, dim, pos0, rows; float base; };
 struct CacheBatch { uint layer, pos0, context, width, rows; };
 struct AttentionPrefill { uint heads, kv_heads, dim, pos0, context, layer, rows; };
 struct RopePartial { uint heads, dim, rot, pos; float base; };
+struct RopePartialBatch { uint heads, dim, rot, pos0, rows; float base; };
 struct SsmConv { uint width, history; };
 struct Gdn { uint qk_heads, v_heads, state_dim, layer; float eps; };
 struct SsmConvBatch { uint width, history, rows; };
@@ -1072,6 +1073,22 @@ kernel void rope_neox_partial(device float *x [[buffer(0)]],
     float theta = float(p.pos) / pow(p.base, float(i) / float(pairs));
     float c = cos(theta), s = sin(theta);
     uint base = h * p.dim;
+    float a = x[base + i], b = x[base + i + pairs];
+    x[base + i] = a * c - b * s;
+    x[base + i + pairs] = a * s + b * c;
+}
+
+kernel void rope_neox_partial_batch(device float *x [[buffer(0)]],
+                                    constant RopePartialBatch &p [[buffer(1)]],
+                                    uint index [[thread_position_in_grid]]) {
+    uint pairs = p.rot / 2;
+    uint per_row = p.heads * pairs;
+    if (index >= p.rows * per_row) return;
+    uint row = index / per_row, rem = index % per_row;
+    uint head = rem / pairs, i = rem % pairs;
+    float theta = float(p.pos0 + row) / pow(p.base, float(i) / float(pairs));
+    float c = cos(theta), s = sin(theta);
+    uint base = row * p.heads * p.dim + head * p.dim;
     float a = x[base + i], b = x[base + i + pairs];
     x[base + i] = a * c - b * s;
     x[base + i + pairs] = a * s + b * c;
