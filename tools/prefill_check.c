@@ -143,7 +143,7 @@ int main(int argc, char **argv) {
     uint32_t reference_argmax = argmax(reference, model.vocab);
     uint32_t prefill_argmax = argmax(prefill, model.vocab);
     printf("tokens=%zu chunk=%s split=%u max_abs=%.8g kl=%.3g max_dprob=%.3g argmax=%u/%u\n",
-           tokens.len, getenv("DSM_PREFILL_CHUNK") ? getenv("DSM_PREFILL_CHUNK") : "512",
+           tokens.len, getenv("DSM_PREFILL_CHUNK") ? getenv("DSM_PREFILL_CHUNK") : "default",
            split, max_abs, kl, max_dprob, reference_argmax, prefill_argmax);
     int top_k_ok = same_top_k(reference, prefill, model.vocab);
     printf("top%d=%s\n", TOP_K, top_k_ok ? "same" : "different");
