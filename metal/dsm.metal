@@ -1527,6 +1527,78 @@ kernel void attention_prefill(device const float *q [[buffer(0)]], device const 
     }
 }
 
+kernel void attention_prefill_d256(device const float *q [[buffer(0)]],
+                                   device const float *keys [[buffer(1)]],
+                                   device const float *values [[buffer(2)]],
+                                   device float *out [[buffer(3)]],
+                                   constant AttentionPrefill &p [[buffer(4)]],
+                                   ushort tid [[thread_index_in_threadgroup]],
+                                   ushort lane [[thread_index_in_simdgroup]],
+                                   ushort simdgroup [[simdgroup_index_in_threadgroup]],
+                                   uint2 group [[threadgroup_position_in_grid]],
+                                   threadgroup float4 *tile [[threadgroup(0)]]) {
+    constexpr uint ROWS = 4, KEYS = 16, DIM = 256;
+    uint row0 = group.x * ROWS, kvh = group.y;
+    uint q_per_kv = p.heads / p.kv_heads;
+    if (kvh >= p.kv_heads || p.dim != DIM || q_per_kv > 8 ||
+        row0 >= p.rows) return;
+    uint head = kvh * q_per_kv + simdgroup;
+    uint nrows = min(ROWS, p.rows - row0);
+    uint width = p.kv_heads * DIM;
+    threadgroup float4 *k_tile = tile;
+    threadgroup float4 *v_tile = tile + KEYS * (DIM / 4);
+    float4 query[ROWS][2], accum[ROWS][2];
+    float maximum[ROWS], sum[ROWS];
+    for (uint r = 0; r < nrows; ++r) {
+        uint offset = ((row0 + r) * p.heads + head) * (DIM / 4) + 2 * lane;
+        query[r][0] = ((device const float4 *)q)[offset];
+        query[r][1] = ((device const float4 *)q)[offset + 1];
+        accum[r][0] = 0.0f; accum[r][1] = 0.0f;
+        maximum[r] = -INFINITY; sum[r] = 0.0f;
+    }
+    uint last = p.pos0 + row0 + nrows - 1;
+    for (uint base = 0; base <= last; base += KEYS) {
+        uint count = min(KEYS, last + 1 - base);
+        for (uint i = tid; i < count * (DIM / 4); i += q_per_kv * 32) {
+            uint key = i / (DIM / 4), element = i % (DIM / 4);
+            uint offset = ((p.layer * p.context + base + key) * width + kvh * DIM) /
+                          4 + element;
+            k_tile[i] = ((device const float4 *)keys)[offset];
+            v_tile[i] = ((device const float4 *)values)[offset];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < nrows; ++r) {
+            uint qpos = p.pos0 + row0 + r;
+            if (base > qpos) continue;
+            float scores[KEYS];
+            float next = maximum[r];
+            for (uint key = 0; key < count; ++key) {
+                float dotv = dot(query[r][0], k_tile[key * (DIM / 4) + 2 * lane]) +
+                             dot(query[r][1], k_tile[key * (DIM / 4) + 2 * lane + 1]);
+                float score = simd_sum(dotv) * rsqrt(256.0f);
+                scores[key] = base + key <= qpos ? score : -INFINITY;
+                next = max(next, scores[key]);
+            }
+            float old_scale = exp(maximum[r] - next);
+            accum[r][0] *= old_scale; accum[r][1] *= old_scale;
+            sum[r] *= old_scale;
+            for (uint key = 0; key < count; ++key) {
+                float weight = exp(scores[key] - next);
+                sum[r] += weight;
+                accum[r][0] += weight * v_tile[key * (DIM / 4) + 2 * lane];
+                accum[r][1] += weight * v_tile[key * (DIM / 4) + 2 * lane + 1];
+            }
+            maximum[r] = next;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint r = 0; r < nrows; ++r) {
+        uint offset = ((row0 + r) * p.heads + head) * (DIM / 4) + 2 * lane;
+        ((device float4 *)out)[offset] = accum[r][0] / sum[r];
+        ((device float4 *)out)[offset + 1] = accum[r][1] / sum[r];
+    }
+}
+
 kernel void add_inplace(device float *x [[buffer(0)]], device const float *y [[buffer(1)]], constant uint &n [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i < n) x[i] += y[i]; }
 kernel void swiglu(device float *gate [[buffer(0)]], device const float *up [[buffer(1)]], constant uint &n [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i < n) { float x=gate[i]; gate[i]=(x/(1.0f+exp(-x)))*up[i]; } }
 
