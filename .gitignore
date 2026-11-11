@@ -6,4 +6,11 @@ models/
 /check-prefill
 /tests/bin/
 /test_server_parse
+/bench-prefill
+/check-ref
+/check-rewind
+/gguf-inspect
+/llama-ref
+/test_gguf
+/test_quants
 *.metallib
