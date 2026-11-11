@@ -99,6 +99,7 @@ kernel void q8_gemv(
 }
 
 struct block_q4_K { half d; half dmin; uchar scales[12]; uchar qs[128]; };
+struct block_q5_K { half d; half dmin; uchar scales[12]; uchar qh[32]; uchar qs[128]; };
 
 kernel void q4k_gemv(
         constant ggml_metal_kargs_mul_mv &args [[buffer(3)]],
@@ -602,6 +603,24 @@ void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & re
 }
 
 template <typename type4x4>
+void dequantize_q5_K(device const block_q5_K *xb, short il, thread type4x4 &reg) {
+    device const uchar *q = xb->qs;
+    device const uchar *qh = xb->qh;
+    short is = (il / 4) * 2;
+    q += 32 * (il / 4) + 16 * (il & 1);
+    qh += 16 * (il & 1);
+    uchar high = 1 << (il / 2);
+    il &= 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il / 2, xb->scales);
+    const float d = float(xb->d) / (il < 2 ? 1.f : 16.f);
+    const float dl = d * sc[0], ml = float(xb->dmin) * sc[1];
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
+    const float high_value = il < 2 ? 16.f : 256.f;
+    for (int i = 0; i < 16; ++i)
+        reg[i / 4][i % 4] = dl * ((q[i] & mask) + (qh[i] & high ? high_value : 0)) - ml;
+}
+
+template <typename type4x4>
 void dequantize_q6_K(device const block_q6_K *xb, short il, thread type4x4 & reg) {
     const half d_all = xb->d;
     device const uint16_t * ql = (device const uint16_t *)xb->ql;
@@ -854,6 +873,7 @@ template [[host_name("mul_mm_q8_0")]] kernel dsm_mul_mm_t kernel_mul_mm<half, ha
 template [[host_name("mul_mm_q2_K")]] kernel dsm_mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>;
 template [[host_name("mul_mm_q3_K")]] kernel dsm_mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q3_K, QK_NL, dequantize_q3_K, float, float4x4, float, float2x4>;
 template [[host_name("mul_mm_q4_K")]] kernel dsm_mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
+template [[host_name("mul_mm_q5_K")]] kernel dsm_mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_K, QK_NL, dequantize_q5_K, float, float4x4, float, float2x4>;
 template [[host_name("mul_mm_q6_K")]] kernel dsm_mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
 
 kernel void mul_mm_id_map0(
@@ -1008,6 +1028,7 @@ template [[host_name("mul_mm_id_q8_0")]] kernel dsm_mul_mm_id_t kernel_mul_mm_id
 template [[host_name("mul_mm_id_q2_K")]] kernel dsm_mul_mm_id_t kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>;
 template [[host_name("mul_mm_id_q3_K")]] kernel dsm_mul_mm_id_t kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q3_K, QK_NL, dequantize_q3_K, float, float4x4, float, float2x4>;
 template [[host_name("mul_mm_id_q4_K")]] kernel dsm_mul_mm_id_t kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
+template [[host_name("mul_mm_id_q5_K")]] kernel dsm_mul_mm_id_t kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_K, QK_NL, dequantize_q5_K, float, float4x4, float, float2x4>;
 template [[host_name("mul_mm_id_q6_K")]] kernel dsm_mul_mm_id_t kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
 typedef decltype(kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) dsm_mul_mm_f32_t;
 typedef decltype(kernel_mul_mm_id<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) dsm_mul_mm_id_f32_t;
@@ -1022,7 +1043,9 @@ template [[host_name("mul_mm_id_q2_K_f32")]] kernel dsm_mul_mm_id_f32_t kernel_m
 template [[host_name("mul_mm_q3_K_f32")]] kernel dsm_mul_mm_f32_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q3_K, QK_NL, dequantize_q3_K, float, float4x4, float, float2x4>;
 template [[host_name("mul_mm_id_q3_K_f32")]] kernel dsm_mul_mm_id_f32_t kernel_mul_mm_id<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q3_K, QK_NL, dequantize_q3_K, float, float4x4, float, float2x4>;
 template [[host_name("mul_mm_q4_K_f32")]] kernel dsm_mul_mm_f32_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
+template [[host_name("mul_mm_q5_K_f32")]] kernel dsm_mul_mm_f32_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q5_K, QK_NL, dequantize_q5_K, float, float4x4, float, float2x4>;
 template [[host_name("mul_mm_id_q4_K_f32")]] kernel dsm_mul_mm_id_f32_t kernel_mul_mm_id<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
+template [[host_name("mul_mm_id_q5_K_f32")]] kernel dsm_mul_mm_id_f32_t kernel_mul_mm_id<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q5_K, QK_NL, dequantize_q5_K, float, float4x4, float, float2x4>;
 template [[host_name("mul_mm_q6_K_f32")]] kernel dsm_mul_mm_f32_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
 template [[host_name("mul_mm_id_q6_K_f32")]] kernel dsm_mul_mm_id_f32_t kernel_mul_mm_id<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
 template [[host_name("mul_mm_f32w_f32")]] kernel dsm_mul_mm_f32_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>;
