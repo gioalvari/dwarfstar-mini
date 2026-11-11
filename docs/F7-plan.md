@@ -392,6 +392,47 @@ is M2).
   5. chunked GDA only if GDN > 25% of prefill.
 - Gate: Step 2/3 correctness gates still pass.
 
+### Result 4 (2026-11-11)
+
+Each milestone either has a kill switch whose output is byte-identical to the
+parent commit, or is itself byte-identical (compared with `cmp` on
+`check-prefill --dump` logits).
+
+| Milestone | Commit | Change | Effect |
+|---|---|---|---|
+| M0 | `e11d0bc` | per-stage GPU timings (`DSM_STAGE_PROF=1 ./bench-prefill`) | no behaviour change |
+| M1 | `18e731d` | default prefill chunk 1024 (dense models with FFN > 16384, i.e. the 27B, stay at 512) | +5-7% at 570 tokens |
+| M2 | `b1cca16` | F32-weight `mul_mm` for router, alpha, beta and the qwen3moe router (`DSM_MM_F32W=0` disables it) | Qwen3.6 522 → 567 |
+| M3 | `558bbbd` | batched `split_q_gate` and partial RoPE | byte-identical |
+| M4 | `be666aa` | `attention_prefill_d256` (`DSM_ATTN_PREFILL=0` disables it) | Qwen3.6 476 → 679 (570 tok), 315 → 512 (3990 tok) |
+| M5 | `e89c5ea` | `mul_mm_id_map0` once per MoE layer instead of three times | byte-identical; Qwen3.6 +5-10%, 30B 498 → 557 |
+| M6 | rejected | fused gate+up+SwiGLU `mul_mm_id` | byte-identical but 3.5x slower on Qwen3.6 (float staging plus 16 accumulators), neutral on the 30B |
+| M7 | `28165eb` | key-tiled dim-128 `attention_prefill` for qwen3 (`DSM_ATTN_PREFILL=0` disables it) | 3990 tok: 1.7B +30-40%, 30B +50% |
+
+Prefill in tok/s (`bench-prefill`, best warm rep of 3, repeated prompt P;
+llama.cpp build 9860 `-fa 1`). "Before" is main before M0 at 570 tokens.
+
+| Model | before | 570 tok | 3990 tok | llama pp512 | ratio |
+|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B UD-Q4_K_S | ~492 | 706 | 630 | 754 | 94% |
+| Qwen3-30B-A3B asym | ~437 | 613 | 319 | 849 | 72% |
+| Qwen3-1.7B Q4_K_M | ~1005 | 1064 | 466 | 1882 | 57% |
+| Qwen3.8-27B Q4_K_M | ~101 | 93-100 | - | 125.5 | ~77% |
+
+Decode was not part of Step 4: Qwen3.6 52-58 tok/s (llama tg128 52.1), 27B
+11.3 (llama 11.5).
+
+`check-prefill` references on P after Step 4 (max_abs / KL / max_dprob):
+Qwen3.6 0.124 / 6.3e-6 / 6.1e-4; 27B 9.2e-4 / 5.0e-11 / 4.1e-7; 30B-asym
+0.253 / 4.3e-7 / 7.9e-6; 1.7B 0.0131 / 1.7e-9 / 1.1e-6. Split prompts
+(100, 300) match the unsplit run, chunk 7 is exact, and `check-rewind` gives
+KL 0. At n=1100 the 1.7B fails only the dense `max_abs < 5e-2` gate (0.084,
+and 0.135 with M7 off), with KL, top-5 and argmax passing: this predates
+Step 4.
+
+Remaining gap: routed experts are ~45% of qwen35 prefill time. qwen3 at
+long context and the small dense model lag furthest behind llama.cpp.
+
 ## Step 5: `qwen35` dense (Qwen3.8-27B Q4_K_M)
 
 Size: M, once Steps 0-3 exist.
