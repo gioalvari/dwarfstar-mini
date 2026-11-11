@@ -1904,6 +1904,28 @@ kernel void expert_q4k_gemv(
     }
 }
 
+kernel void expert_q5k_gemv(
+        device const uchar *w [[buffer(0)]], device const float *input [[buffer(1)]],
+        device float *output [[buffer(2)]], constant ExpertGemv &p [[buffer(3)]],
+        device const uint *ids [[buffer(4)]], ushort tid [[thread_index_in_threadgroup]],
+        uint3 group [[threadgroup_position_in_grid]], threadgroup float *sum [[threadgroup(0)]]) {
+    uint row = group.x, slot = group.z;
+    float value = 0.0f;
+    if (row < p.out) {
+        device const uchar *base = w + uint64_t(ids[slot]) * p.expert_stride +
+                                  uint64_t(row) * (p.in / 256) * sizeof(block_q5_K);
+        device const float *x = input + slot * p.input_stride;
+        for (uint j = tid; j < p.in; j += 256)
+            value += k_weight(base + (j / 256) * sizeof(block_q5_K), 3, j % 256) * x[j];
+    }
+    sum[tid] = value; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) {
+        if (tid < step) sum[tid] += sum[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (!tid && row < p.out) output[slot * p.out_stride + row] = sum[0];
+}
+
 kernel void expert_q3k_gemv(
         device const char *w [[buffer(0)]], device const float *input [[buffer(1)]],
         device float *output [[buffer(2)]], constant ExpertGemv &p [[buffer(3)]],
