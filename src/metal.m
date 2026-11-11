@@ -319,8 +319,9 @@ static void encode_gemv_at(dsm_metal *s, id<MTLComputeCommandEncoder> e,
         [e setBytes:&mul_mv length:sizeof(mul_mv) atIndex:3];
         [e dispatchThreadgroups:MTLSizeMake((p.out + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
     } else if (w->type == GGML_TYPE_Q5_K) {
-        [e setBytes:&p length:sizeof(p) atIndex:3];
-        [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0]; [e dispatchThreadgroups:MTLSizeMake(p.out, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [e setBytes:&mul_mv length:sizeof(mul_mv) atIndex:3];
+        [e dispatchThreadgroups:MTLSizeMake((p.out + 3) / 4, 1, 1)
+ threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
     } else if (w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q6_K) {
         [e setBytes:&mul_mv length:sizeof(mul_mv) atIndex:3];
         [e dispatchThreadgroups:MTLSizeMake((p.out + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
@@ -384,7 +385,7 @@ static void encode_expert_gemv(dsm_metal *s, id<MTLComputeCommandEncoder> e,
         [e setThreadgroupMemoryLength:2 * 32 * sizeof(float) atIndex:0];
         [e dispatchThreadgroups:MTLSizeMake((p.out + 1) / 2, 1, s->m->experts_used)
  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
-    } else if (w->type == GGML_TYPE_Q3_K || w->type == GGML_TYPE_Q4_K) {
+    } else if (w->type == GGML_TYPE_Q3_K || w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q5_K) {
         [e dispatchThreadgroups:MTLSizeMake((p.out + 3) / 4, 1, s->m->experts_used) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
     } else {
         [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
@@ -419,7 +420,7 @@ static void encode_expert_gemv_batch_row(dsm_metal *s,
         [e setThreadgroupMemoryLength:2 * 32 * sizeof(float) atIndex:0];
         [e dispatchThreadgroups:MTLSizeMake((p.out + 1) / 2, 1, s->m->experts_used)
  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
-    } else if (w->type == GGML_TYPE_Q3_K || w->type == GGML_TYPE_Q4_K) {
+    } else if (w->type == GGML_TYPE_Q3_K || w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q5_K) {
         [e dispatchThreadgroups:MTLSizeMake((p.out + 3) / 4, 1, s->m->experts_used)
   threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
     } else {
@@ -474,7 +475,7 @@ static void encode_moe_down(dsm_metal *s, id<MTLComputeCommandEncoder> e, const 
     if (w->down_exps->type == GGML_TYPE_Q8_0) {
         [e setThreadgroupMemoryLength:2 * 32 * sizeof(float) atIndex:0];
         [e dispatchThreadgroups:MTLSizeMake((p.out + 1) / 2, 1, m->experts_used) threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
-    } else if (w->down_exps->type == GGML_TYPE_Q3_K || w->down_exps->type == GGML_TYPE_Q4_K) {
+    } else if (w->down_exps->type == GGML_TYPE_Q3_K || w->down_exps->type == GGML_TYPE_Q4_K || w->down_exps->type == GGML_TYPE_Q5_K) {
         [e dispatchThreadgroups:MTLSizeMake((p.out + 3) / 4, 1, m->experts_used) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
     } else {
         [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];

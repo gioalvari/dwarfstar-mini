@@ -399,7 +399,35 @@ inline float k_weight(device const uchar *b, uint type, uint i) {
 #define K_GEMV(NAME, TYPE, BYTES) \
 kernel void NAME(device const uchar *w [[buffer(0)]], device const float *x [[buffer(1)]], device float *y [[buffer(2)]], constant Gemv &p [[buffer(3)]], ushort tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]], threadgroup float *sum [[threadgroup(0)]]) { \
     float v=0; if(row<p.out) { device const uchar *r=w+row*(p.in/256)*BYTES; for(uint j=tid;j<p.in;j+=256) v+=k_weight(r+(j/256)*BYTES,TYPE,j%256)*x[j]; } sum[tid]=v; threadgroup_barrier(mem_flags::mem_threadgroup); for(uint step=128;step;step>>=1){if(tid<step)sum[tid]+=sum[tid+step];threadgroup_barrier(mem_flags::mem_threadgroup);} if(!tid&&row<p.out)y[row]=sum[0]; }
-K_GEMV(q5k_gemv, 3, 176)
+inline float q5k_weight(device const block_q5_K *b, uint i) {
+    uint group = i / 32, index = i % 32, half_group = (i / 64) & 1;
+    uchar q = b->qs[(i / 64) * 32 + index];
+    float value = half_group ? float(q >> 4) : float(q & 15);
+    uint high_bit = 1u << (group / 2 + 2 * (i / 128));
+    if (b->qh[index] & high_bit) value += 16.f;
+    return float(b->d) * k4_scale(b->scales, group, false) * value -
+           float(b->dmin) * k4_scale(b->scales, group, true);
+}
+kernel void q5k_gemv(
+        constant ggml_metal_kargs_mul_mv &args [[buffer(3)]],
+        device const char *src0 [[buffer(0)]], device const char *src1 [[buffer(1)]],
+        device char *dst [[buffer(2)]], uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = 2, NSG = 2;
+    int first = (tgpig.x * NSG + sg) * NR0;
+    device const float *input = (device const float *)(src1 + tgpig.y * args.nb11 + tgpig.z * args.nb12);
+    for (short row = 0; row < NR0 && first + row < args.ne0; ++row) {
+        device const block_q5_K *weights = (device const block_q5_K *)(src0 +
+            uint64_t(first + row) * args.nb01 + tgpig.z * args.nb02);
+        float total = 0.f;
+        for (uint block = 0; block < args.ne00 / 256; ++block)
+            for (uint i = lane; i < 256; i += 32)
+                total += k_weight((device const uchar *)(weights + block), 3, i) *
+                         input[block * 256 + i];
+        total = simd_sum(total);
+        if (!lane) ((device float *)dst)[tgpig.y * args.ne0 + first + row] = total;
+    }
+}
 
 struct block_q3_K { uchar hmask[32]; uchar qs[64]; uchar scales[12]; half d; };
 
@@ -1905,25 +1933,26 @@ kernel void expert_q4k_gemv(
 }
 
 kernel void expert_q5k_gemv(
-        device const uchar *w [[buffer(0)]], device const float *input [[buffer(1)]],
+        device const char *w [[buffer(0)]], device const float *input [[buffer(1)]],
         device float *output [[buffer(2)]], constant ExpertGemv &p [[buffer(3)]],
-        device const uint *ids [[buffer(4)]], ushort tid [[thread_index_in_threadgroup]],
-        uint3 group [[threadgroup_position_in_grid]], threadgroup float *sum [[threadgroup(0)]]) {
-    uint row = group.x, slot = group.z;
-    float value = 0.0f;
-    if (row < p.out) {
-        device const uchar *base = w + uint64_t(ids[slot]) * p.expert_stride +
-                                  uint64_t(row) * (p.in / 256) * sizeof(block_q5_K);
-        device const float *x = input + slot * p.input_stride;
-        for (uint j = tid; j < p.in; j += 256)
-            value += k_weight(base + (j / 256) * sizeof(block_q5_K), 3, j % 256) * x[j];
+        device const uint *ids [[buffer(4)]], uint3 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = 2, NSG = 2;
+    uint slot = group.z;
+    int first = (group.x * NSG + sg) * NR0;
+    device const float *x = input + slot * p.input_stride;
+    for (short row = 0; row < NR0 && first + row < p.out; ++row) {
+        device const block_q5_K *weights = (device const block_q5_K *)(w +
+            uint64_t(ids[slot]) * p.expert_stride + uint64_t(first + row) *
+            (p.in / 256) * sizeof(block_q5_K));
+        float total = 0.f;
+        for (uint block = 0; block < p.in / 256; ++block)
+            for (uint i = lane; i < 256; i += 32)
+                total += k_weight((device const uchar *)(weights + block), 3, i) *
+                         x[block * 256 + i];
+        total = simd_sum(total);
+        if (!lane) output[slot * p.out_stride + first + row] = total;
     }
-    sum[tid] = value; threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint step = 128; step; step >>= 1) {
-        if (tid < step) sum[tid] += sum[tid + step];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (!tid && row < p.out) output[slot * p.out_stride + row] = sum[0];
 }
 
 kernel void expert_q3k_gemv(
