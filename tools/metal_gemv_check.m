@@ -11,7 +11,7 @@ static float random_value(uint32_t *state) { *state = *state * 1664525u + 101390
 static int matmul_supported(uint32_t type) {
     return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q2_K ||
            type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ||
-           type == GGML_TYPE_Q6_K;
+           type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
 }
 static void check_f32_matmul(dsm_metal *metal, const gguf_tensor *weights,
                              const char *name) {
