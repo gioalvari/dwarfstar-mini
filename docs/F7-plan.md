@@ -489,6 +489,63 @@ Size: M.
 - Gates: `check-metal-gemv` rel < 2e-3 on a real Q5_K expert tensor; then the
   Step 2/3 gates on UD-Q4_K_M.
 
+### Result 6 (2026-11-11)
+
+Models:
+- unsloth `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (22,134,528,992 B). Its 37
+  `ffn_down_exps` are Q5_K (6.83 GB); the remaining 3 are Q6_K. Routed
+  gate/up are Q4_K.
+- `Qwen3-1.7B-Q5_K_M.gguf`, made locally with
+  `llama-quantize --allow-requantize` from Q8_0: 168 Q5_K tensors and 29 Q6_K.
+
+Commits:
+- `c36deb2`: `dequantize_q5_K` and `mul_mm_q5_K` (half and `_f32`).
+- `73de025`: `expert_q5k_gemv` and `mul_mm_id_q5_K` (+ `_f32`); init accepts
+  Q5_K experts.
+- `a369376`: Q5_K added to `check-metal-gemv`.
+- `018c508`: vectorized dense and expert Q5_K GEMVs.
+
+| Gate | Result |
+|---|---|
+| `check-metal-gemv`, 1.7B Q5_K_M | Q5_K GEMV max_rel 7.2e-5; Q5_K `mul_mm` rel L2 2.8e-4 |
+| `check-metal-gemv`, UD-Q4_K_M | `mul_mm_id` Q5_K `ffn_down_exps` rel L2 1.6e-7; all hybrid/F32 checks pass |
+| `check-ref`, UD-Q4_K_M, France / fib | KL median 3.4e-11 / 8.1e-11, top-1 100%, PASS |
+| `check-ref`, 1.7B Q5_K_M, France / fib | KL median 1.4e-12 / 1.5e-12, top-1 100%, PASS |
+| greedy 32 | identical to `llama-ref --greedy 32` on both models and both prompts; UD-Q4_K_M runs deterministic |
+| `check-prefill`, 1.7B Q5_K_M, P | max_abs 0.0114, KL 3.0e-10, PASS |
+| `check-prefill`, UD-Q4_K_M, chunk 7 `--n 33` | exact |
+| `check-rewind`, UD-Q4_K_M, P | KL 0, stale checkpoint invalidated |
+| other models | Q17 / Q30 / Q36 UD-Q4_K_S `check-prefill` logit dumps byte-identical to the parent |
+
+`check-prefill` on UD-Q4_K_M at chunk 1024 is just outside the MoE gate:
+- n=570: KL 5.9e-5, max_dprob 1.6e-3.
+- n=300: KL 1.0e-4.
+- n=513: KL 2.9e-4, max_dprob 3.4e-3.
+
+Top-5 is the same in every case, `--split 300` matches the unsplit run, and
+chunk ≤ 8 is exact. This is the same precision effect as in Result 3 (MoE
+near-ties carried by the recurrent state), at llama.cpp's own level.
+Last-position KL:
+- n=300: llama batched vs llama token-by-token 1.1e-4; DSM hybrid vs llama
+  token-by-token 1.0e-4.
+- n=570: 2.1e-3 vs 2.2e-3.
+
+Accepted.
+
+Speed: `bench-prefill` best warm rep at 570 tokens; decode is the
+lighthouse prompt, `-n 128`, best of 3. llama.cpp was measured with
+`llama-bench -p 512 -n 128 -fa 1 -r 2`.
+
+| Model | DSM prefill | DSM decode (naive Q5_K GEMV → vectorized) | llama pp512 | llama tg128 |
+|---|---|---|---|---|
+| Qwen3.6-35B-A3B UD-Q4_K_M | 715 | 34.3 → 47.1 | 628 | 44.3 |
+| Qwen3-1.7B Q5_K_M | 979 | 31.9 → 59.1 | 1829 | 97.8 |
+| Qwen3.6-35B-A3B UD-Q4_K_S (reference) | 742 | 54.7 | 754 | 52.1 |
+
+Caveat: deleting Coder-30B-Q8_0 to make room for this model removed the only
+local file larger than `maxBufferLength`. As a result, the overlapping-view fix
+(`73c4be3`) currently has no end-to-end test.
+
 ## Top correctness risks, and which gate catches each
 
 | # | Risk | Caught by |
