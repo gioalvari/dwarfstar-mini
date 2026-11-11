@@ -1599,6 +1599,68 @@ kernel void attention_prefill_d256(device const float *q [[buffer(0)]],
     }
 }
 
+kernel void attention_prefill_d128_tiled(device const float *q [[buffer(0)]],
+                                         device const float *keys [[buffer(1)]],
+                                         device const float *values [[buffer(2)]],
+                                         device float *out [[buffer(3)]],
+                                         constant AttentionPrefill &p [[buffer(4)]],
+                                         ushort tid [[thread_index_in_threadgroup]],
+                                         ushort lane [[thread_index_in_simdgroup]],
+                                         ushort simdgroup [[simdgroup_index_in_threadgroup]],
+                                         uint2 group [[threadgroup_position_in_grid]],
+                                         threadgroup float4 *tile [[threadgroup(0)]]) {
+    constexpr uint ROWS = 4, KEYS = 32, DIM = 128;
+    uint row0 = group.x * ROWS, kvh = group.y;
+    uint q_per_kv = p.heads / p.kv_heads;
+    if (kvh >= p.kv_heads || p.dim != DIM || q_per_kv > 8 || row0 >= p.rows)
+        return;
+    uint head = kvh * q_per_kv + simdgroup;
+    uint nrows = min(ROWS, p.rows - row0), width = p.kv_heads * DIM;
+    threadgroup float4 *k_tile = tile;
+    threadgroup float4 *v_tile = tile + KEYS * (DIM / 4);
+    float4 query[ROWS], accum[ROWS]; float maximum[ROWS], sum[ROWS];
+    for (uint r = 0; r < nrows; ++r) {
+        query[r] = ((device const float4 *)q)[((row0 + r) * p.heads + head) *
+                                               (DIM / 4) + lane];
+        accum[r] = 0.0f; maximum[r] = -INFINITY; sum[r] = 0.0f;
+    }
+    uint last = p.pos0 + row0 + nrows - 1;
+    for (uint base = 0; base <= last; base += KEYS) {
+        uint count = min(KEYS, last + 1 - base);
+        for (uint i = tid; i < count * (DIM / 4); i += q_per_kv * 32) {
+            uint key = i / (DIM / 4), element = i % (DIM / 4);
+            uint offset = ((p.layer * p.context + base + key) * width + kvh * DIM) /
+                          4 + element;
+            k_tile[i] = ((device const float4 *)keys)[offset];
+            v_tile[i] = ((device const float4 *)values)[offset];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < nrows; ++r) {
+            uint qpos = p.pos0 + row0 + r;
+            if (base > qpos) continue;
+            float scores[KEYS], next = maximum[r];
+            for (uint key = 0; key < count; ++key) {
+                float score = simd_sum(dot(query[r], k_tile[key * (DIM / 4) + lane])) *
+                              rsqrt(128.0f);
+                scores[key] = base + key <= qpos ? score : -INFINITY;
+                next = max(next, scores[key]);
+            }
+            float old_scale = exp(maximum[r] - next);
+            accum[r] *= old_scale; sum[r] *= old_scale;
+            for (uint key = 0; key < count; ++key) {
+                float weight = exp(scores[key] - next);
+                sum[r] += weight;
+                accum[r] += weight * v_tile[key * (DIM / 4) + lane];
+            }
+            maximum[r] = next;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint r = 0; r < nrows; ++r)
+        ((device float4 *)out)[((row0 + r) * p.heads + head) * (DIM / 4) + lane] =
+            accum[r] / sum[r];
+}
+
 kernel void add_inplace(device float *x [[buffer(0)]], device const float *y [[buffer(1)]], constant uint &n [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i < n) x[i] += y[i]; }
 kernel void swiglu(device float *gate [[buffer(0)]], device const float *up [[buffer(1)]], constant uint &n [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i < n) { float x=gate[i]; gate[i]=(x/(1.0f+exp(-x)))*up[i]; } }
 
