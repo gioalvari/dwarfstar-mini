@@ -4,10 +4,10 @@ Goal: correct greedy text on **Qwen3.6-35B-A3B-UD-Q4_K_S** using the simplest
 correct Metal path. Perf work comes after that. Then Qwen3.8-27B dense, then
 Q5_K for UD-Q4_K_M.
 
-Inputs: /tmp/dsm-f7/RESEARCH.md (llama.cpp 954de248 refs, "RS §n" below), and
-the DSM tree at ef4ada9, read-only. I read the target GGUF header myself with a
-DSM-based dump in /tmp/dsm-f7/hdr (meta.txt, tmpl.jinja). The file was still
-downloading: 1.38 / 20.89 GB, but the header and tensor directory were complete.
+Inputs: a llama.cpp research note at 954de248 ("RS §n" below), and the DSM tree
+at ef4ada9, read-only. I read the target GGUF header with a DSM-based dump of
+the metadata and template. The file was still downloading: 1.38 / 20.89 GB, but
+the header and tensor directory were complete.
 
 ## Facts verified from the target file header (UD-Q4_K_S)
 
@@ -170,7 +170,7 @@ Graph details confirmed in llama.cpp source:
   - Per layer: relative L2 of `l_out-L`.
 - Debug hook in metal.m behind `DSM_DUMP_DIR` (decode only): one command buffer
   per layer, write the residual after each layer. Same pattern as the F6 bisect
-  tools in /tmp/dsm-debug.
+  debug tools.
 - Gate for the tool itself: llama Metal vs llama CPU gives a KL floor `F` on 3
   prompts × 64 positions (record it). Greedy text from llama-ref is coherent.
   b9860 is older than the research commit (R11).

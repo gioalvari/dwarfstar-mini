@@ -7,7 +7,7 @@ separately committable steps, each gated by parity.
 
 1. Keep the decode path untouched. Add a separate batch path (`encode_*_batch`)
    with its own `[chunk=512][width]` buffers. Decode stays bitwise identical;
-   diffs only add code. ds4 does the same (docs/ds4-notes.md:56).
+   diffs only add code. ds4 does the same (ds4-notes.md:56).
 2. Copy kernels verbatim from llama.cpp, legacy (non-`GGML_METAL_HAS_TENSOR`)
    branches only. ds4's `kernel_mul_mm` is the same copy
    (ds4-ref/metal/dense.metal:2515, instantiated :2931/:2933, dispatched

@@ -103,8 +103,8 @@ skipped rather than relying on memory pressure.
 `Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf` with the same per-tensor scheme:
 
 ```sh
-../llama.cpp/build/bin/llama-quantize --allow-requantize \
-  --tensor-type-file /tmp/qwen3-coder-asym-types.txt \
+llama-quantize --allow-requantize \
+  --tensor-type-file qwen3-coder-asym-types.txt \
   models/Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf \
   models/Qwen3-Coder-30B-A3B-asym.gguf Q8_0
 ```
