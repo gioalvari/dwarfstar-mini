@@ -320,8 +320,8 @@ static void encode_gemv_at(dsm_metal *s, id<MTLComputeCommandEncoder> e,
         [e dispatchThreadgroups:MTLSizeMake((p.out + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
     } else if (w->type == GGML_TYPE_Q5_K) {
         [e setBytes:&mul_mv length:sizeof(mul_mv) atIndex:3];
-        [e dispatchThreadgroups:MTLSizeMake((p.out + 3) / 4, 1, 1)
- threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+        [e dispatchThreadgroups:MTLSizeMake((p.out + 1) / 2, 1, 1)
+  threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
     } else if (w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q6_K) {
         [e setBytes:&mul_mv length:sizeof(mul_mv) atIndex:3];
         [e dispatchThreadgroups:MTLSizeMake((p.out + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
