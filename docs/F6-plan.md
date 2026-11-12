@@ -204,9 +204,9 @@ models use KL below `1e-4` and maximum probability difference below `1e-3`,
 plus matching argmax, top-5, and 64-token greedy continuation. The larger MoE
 absolute-logit values are benign expert-routing near-ties.
 
-Bugs fixed during the rollout: the `attention_decode` softmax race (`ad94b14`),
-batched expert SwiGLU rows (`8d52b89`), and a Metal weight-view boundary
-straddle for Coder Q8_0 (`73c4be3`). Weight residency now requests `madvise`
+Bugs fixed during the rollout: the `attention_decode` softmax race (`e3fd12f`),
+batched expert SwiGLU rows (`68b726a`), and a Metal weight-view boundary
+straddle for Coder Q8_0 (`0b10d8e`). Weight residency now requests `madvise`
 and macOS 15 Metal residency for mapped weight views.
 
 The remaining throughput gap versus llama.cpp is prioritized as: fuse expert
@@ -227,10 +227,10 @@ same commands and model files as their preceding milestone.
 | before decode work | 30B-A3B asym | 45.3 | 31.6 | — |
 |  | Coder-30B-A3B Q8_0 | 25.8 | 20.3 | — |
 |  | 1.7B Q4_K_M | 117.0 | 70.0 | — |
-| after `3259e7e` Vectorize Q8_0 expert GEMV | 30B-A3B asym | 49.0 | 31.8 | — |
+| after `b6a1572` Vectorize Q8_0 expert GEMV | 30B-A3B asym | 49.0 | 31.8 | — |
 |  | Coder-30B-A3B Q8_0 | 41.4 | 32.7 | — |
 |  | 1.7B Q4_K_M | 132.0 | 79.0 | — |
-| after `5e0494f` parallel route_topk | 30B-A3B asym | 63.9 | 41.0 | 19.8 |
+| after `ef4ada9` parallel route_topk | 30B-A3B asym | 63.9 | 41.0 | 19.8 |
 |  | Coder-30B-A3B Q8_0 | 52.9 | 36.7 | — |
 |  | 1.7B Q4_K_M | 127.2 | 76.9 | — |
 | after split-K flash decode | 30B-A3B asym | 64.9 | 60.4 | 48.4 |

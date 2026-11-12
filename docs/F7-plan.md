@@ -5,7 +5,7 @@ correct Metal path. Perf work comes after that. Then Qwen3.8-27B dense, then
 Q5_K for UD-Q4_K_M.
 
 Inputs: /tmp/dsm-f7/RESEARCH.md (llama.cpp 954de248 refs, "RS §n" below), and
-the DSM tree at 5e0494f, read-only. I read the target GGUF header myself with a
+the DSM tree at ef4ada9, read-only. I read the target GGUF header myself with a
 DSM-based dump in /tmp/dsm-f7/hdr (meta.txt, tmpl.jinja). The file was still
 downloading: 1.38 / 20.89 GB, but the header and tensor directory were complete.
 
@@ -260,9 +260,9 @@ flash-decoding fixer to land first.
   - `./dsm --chat` answers coherently.
 - Size: L, ~600 LOC across metal+m.
 
-**Result 2a-2c (2026-11-08, `ee006bc`).** The first attempt failed because the
+**Result 2a-2c (2026-11-08, `cfcf33a`).** The first attempt failed because the
 1-D `ffn_gate_inp_shexp` weight had `dims[1] = 0`. The F32 GEMV then dispatched
-zero rows, so the shared-expert gate stayed σ(0) = 0.5 (fixed in `ee006bc`).
+zero rows, so the shared-expert gate stayed σ(0) = 0.5 (fixed in `cfcf33a`).
 After the fix:
 - 5-token prompts (`The capital of France is`, `def fibonacci(n):`): `l_out`
   rel L2 ≤ 2.7e-5 on all 40 layers × 5 positions; KL median 4.4e-11 and
@@ -304,7 +304,7 @@ After the fix:
   - `rewind(k)` for k in {0, ckpt, ckpt+5} then prefill gives the same result
     as fresh.
 
-**Result 2d (2026-11-09, bc49544).** `dsm_metal_rewind` restores a lazy
+**Result 2d (2026-11-09, 53b4d3d).** `dsm_metal_rewind` restores a lazy
 `DSM_CKPT` (2--4, default 3) ring of 83.75 MiB recurrent-state snapshots and
 invalidates future snapshots after every branch. The server checkpoints before
 the final `<|im_start|>` (or last token) and after the prompt, so reasoning
@@ -400,14 +400,14 @@ parent commit, or is itself byte-identical (compared with `cmp` on
 
 | Milestone | Commit | Change | Effect |
 |---|---|---|---|
-| M0 | `e11d0bc` | per-stage GPU timings (`DSM_STAGE_PROF=1 ./bench-prefill`) | no behaviour change |
-| M1 | `18e731d` | default prefill chunk 1024 (dense models with FFN > 16384, i.e. the 27B, stay at 512) | +5-7% at 570 tokens |
-| M2 | `b1cca16` | F32-weight `mul_mm` for router, alpha, beta and the qwen3moe router (`DSM_MM_F32W=0` disables it) | Qwen3.6 522 → 567 |
-| M3 | `558bbbd` | batched `split_q_gate` and partial RoPE | byte-identical |
-| M4 | `be666aa` | `attention_prefill_d256` (`DSM_ATTN_PREFILL=0` disables it) | Qwen3.6 476 → 679 (570 tok), 315 → 512 (3990 tok) |
-| M5 | `e89c5ea` | `mul_mm_id_map0` once per MoE layer instead of three times | byte-identical; Qwen3.6 +5-10%, 30B 498 → 557 |
+| M0 | `9ea0496` | per-stage GPU timings (`DSM_STAGE_PROF=1 ./bench-prefill`) | no behaviour change |
+| M1 | `35e55dd` | default prefill chunk 1024 (dense models with FFN > 16384, i.e. the 27B, stay at 512) | +5-7% at 570 tokens |
+| M2 | `7ad0f71` | F32-weight `mul_mm` for router, alpha, beta and the qwen3moe router (`DSM_MM_F32W=0` disables it) | Qwen3.6 522 → 567 |
+| M3 | `b848262` | batched `split_q_gate` and partial RoPE | byte-identical |
+| M4 | `42d1fdd` | `attention_prefill_d256` (`DSM_ATTN_PREFILL=0` disables it) | Qwen3.6 476 → 679 (570 tok), 315 → 512 (3990 tok) |
+| M5 | `6e536f2` | `mul_mm_id_map0` once per MoE layer instead of three times | byte-identical; Qwen3.6 +5-10%, 30B 498 → 557 |
 | M6 | rejected | fused gate+up+SwiGLU `mul_mm_id` | byte-identical but 3.5x slower on Qwen3.6 (float staging plus 16 accumulators), neutral on the 30B |
-| M7 | `28165eb` | key-tiled dim-128 `attention_prefill` for qwen3 (`DSM_ATTN_PREFILL=0` disables it) | 3990 tok: 1.7B +30-40%, 30B +50% |
+| M7 | `687bc0d` | key-tiled dim-128 `attention_prefill` for qwen3 (`DSM_ATTN_PREFILL=0` disables it) | 3990 tok: 1.7B +30-40%, 30B +50% |
 
 Prefill in tok/s (`bench-prefill`, best warm rep of 3, repeated prompt P;
 llama.cpp build 9860 `-fa 1`). "Before" is main before M0 at 570 tokens.
@@ -453,8 +453,8 @@ Size: M, once Steps 0-3 exist.
 Model: ggml-org `Qwen3.8-27B-Q4_K_M.gguf` (19,403,684,480 B; 851 tensors,
 48 DeltaNet + 16 attention layers; Q4_K FFN and token_embd, Q8_0
 attention/DeltaNet projections and output, F32 norms and ssm vectors).
-Commits: `4931846` dense FFN decode, `819c003` dense FFN batched prefill,
-`d2c69d5` keeps F32 alpha/beta on the row GEMV path (the 27B stores them as
+Commits: `75fa5c4` dense FFN decode, `05c05a7` dense FFN batched prefill,
+`8b968f4` keeps F32 alpha/beta on the row GEMV path (the 27B stores them as
 Q8_0 and goes through `encode_matmul`).
 
 | Gate | Result |
@@ -499,11 +499,11 @@ Models:
   `llama-quantize --allow-requantize` from Q8_0: 168 Q5_K tensors and 29 Q6_K.
 
 Commits:
-- `c36deb2`: `dequantize_q5_K` and `mul_mm_q5_K` (half and `_f32`).
-- `73de025`: `expert_q5k_gemv` and `mul_mm_id_q5_K` (+ `_f32`); init accepts
+- `28cffe6`: `dequantize_q5_K` and `mul_mm_q5_K` (half and `_f32`).
+- `dfdb258`: `expert_q5k_gemv` and `mul_mm_id_q5_K` (+ `_f32`); init accepts
   Q5_K experts.
-- `a369376`: Q5_K added to `check-metal-gemv`.
-- `018c508`: vectorized dense and expert Q5_K GEMVs.
+- `4ddf096`: Q5_K added to `check-metal-gemv`.
+- `9ead885`: vectorized dense and expert Q5_K GEMVs.
 
 | Gate | Result |
 |---|---|
@@ -544,7 +544,7 @@ lighthouse prompt, `-n 128`, best of 3. llama.cpp was measured with
 
 Caveat: deleting Coder-30B-Q8_0 to make room for this model removed the only
 local file larger than `maxBufferLength`. As a result, the overlapping-view fix
-(`73c4be3`) currently has no end-to-end test.
+(`0b10d8e`) currently has no end-to-end test.
 
 ## Top correctness risks, and which gate catches each
 
