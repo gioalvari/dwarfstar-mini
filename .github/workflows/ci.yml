@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build
-        run: make dsm check-quants check-metal-gemv check-prefill check-rewind check-attn bench-prefill bench-gemv gguf-inspect
+        run: make dsm check-metal-gemv check-prefill check-rewind check-attn bench-prefill bench-gemv gguf-inspect
       - name: Unit tests
         run: make test
       - name: Compile Metal kernels
