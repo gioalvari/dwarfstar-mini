@@ -16,7 +16,7 @@ test_server_parse: $(SRC) tests/test_server_parse.c
 gguf-inspect: tools/gguf_inspect.c src/gguf.c src/quants.c src/model.c
 	$(CC) $(CFLAGS) -o $@ tools/gguf_inspect.c src/gguf.c src/quants.c src/model.c -lm
 test: test_gguf test_quants test_server_parse
-	./test_gguf
+	@if [ -f models/Qwen3-1.7B-Q8_0.gguf ]; then ./test_gguf; else echo "test_gguf skipped: models/Qwen3-1.7B-Q8_0.gguf not found"; fi
 	./test_quants
 	./test_server_parse
 check-quants: tools/ggml_dequant_check.c src/gguf.c src/quants.c
