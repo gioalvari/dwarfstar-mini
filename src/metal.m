@@ -1014,8 +1014,7 @@ static void encode_layer_hybrid(dsm_metal *s, id<MTLComputeCommandEncoder> e,
                                 uint32_t layer) {
     const dsm_model *m = s->m;
     const dsm_layer *w = &m->layer[layer];
-    if (!s->decode_fuse || m->is_moe || layer == 0)
-        encode_norm(s, e, s->x, w->attn_norm, s->norm_x, m->dim, 1);
+    encode_norm(s, e, s->x, w->attn_norm, s->norm_x, m->dim, 1);
     if (m->is_recurrent[layer]) {
         uint32_t qk_width = m->ssm_groups * m->ssm_state;
         uint32_t mixed_width = m->ssm_inner + 2 * qk_width;
