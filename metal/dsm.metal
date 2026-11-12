@@ -1781,6 +1781,119 @@ kernel void attention_prefill_d128_tiled(device const float *q [[buffer(0)]],
             accum[r] / sum[r];
 }
 
+/* Causal flash attention for qwen3 prefill (d128, F32 Q/K/V), after llama.cpp
+   kernel_flash_attn_ext (fa_common.metal): QK^T and PV on simdgroup 8x8 matrices,
+   online softmax in float. One threadgroup = 8 query slots x one block of G heads
+   that share a KV head (G = q_per_kv when it divides 8, else 1), so K/V are read once
+   per G heads. K and V are read straight from device memory; threadgroup memory
+   holds Q (8x128), O (8x128), scores (8x64) and an 8x8 V staging tile per simdgroup. */
+kernel void attention_prefill_fa128(device const float *q [[buffer(0)]],
+                                    device const float *keys [[buffer(1)]],
+                                    device const float *values [[buffer(2)]],
+                                    device float *out [[buffer(3)]],
+                                    constant AttentionPrefill &p [[buffer(4)]],
+                                    threadgroup float *shmem [[threadgroup(0)]],
+                                    uint2 group [[threadgroup_position_in_grid]],
+                                    ushort lane [[thread_index_in_simdgroup]],
+                                    ushort simdgroup [[simdgroup_index_in_threadgroup]],
+                                    ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr short DIM = 128, Q = 8, C = 64, NSG = 4, NQ = Q / NSG, DV4 = DIM / 4;
+    constexpr short TILES = DIM / 8 / NSG; /* output 8x8 column tiles per simdgroup */
+    const uint q_per_kv = p.heads / p.kv_heads;
+    if (p.dim != DIM || q_per_kv == 0) return;
+    const uint G = Q % q_per_kv == 0 ? q_per_kv : 1, R = Q / G;
+    const uint iq1 = group.x * R, head0 = group.y * G;
+    if (head0 >= p.heads || iq1 >= p.rows) return;
+    const uint kvh = head0 / q_per_kv, width = p.kv_heads * DIM;
+    threadgroup float *sq = shmem;               /* [Q][DIM] queries      */
+    threadgroup float *so = sq + Q * DIM;        /* [Q][DIM] accumulators */
+    threadgroup float *ss = so + Q * DIM;        /* [Q][C] scores/weights */
+    threadgroup float *sv = ss + Q * C + simdgroup * 64; /* 8x8 V staging */
+    threadgroup float2 *ss2 = (threadgroup float2 *)ss;
+    threadgroup float4 *so4 = (threadgroup float4 *)so;
+    for (uint i = tid; i < Q * DIM; i += NSG * 32) {
+        uint j = i / DIM, row = iq1 + j / G, head = head0 + j % G;
+        sq[i] = row < p.rows ? q[(row * p.heads + head) * DIM + i % DIM] : 0.f;
+        so[i] = 0.f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sums[NQ] = {0.f, 0.f};
+    float maximums[NQ] = {-INFINITY, -INFINITY};
+    const uint ic_end = p.pos0 + min(iq1 + R, p.rows);
+    const uint64_t layer_offset = (uint64_t)p.layer * p.context * width;
+    for (uint base = 0; base < ic_end; base += C) {
+        device const float *pk = keys + layer_offset + (uint64_t)base * width + kvh * DIM;
+        device const float *pv = values + layer_offset + (uint64_t)base * width + kvh * DIM;
+        const uint keys_here = min((uint)C, ic_end - base);
+        /* S = Q K^T: simdgroup sg computes key blocks sg and sg + NSG. Keys past
+           keys_here are read (the cache is allocated in 64-row multiples) but masked. */
+        for (short cc = 0; cc < (C / 8) / NSG; ++cc) {
+            const short kb = cc * NSG + simdgroup;
+            device const float *pkb = pk + (uint64_t)kb * 8 * width;
+            simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.f);
+            simdgroup_float8x8 mq, mk;
+            for (short i = 0; i < DIM / 8; ++i) {
+                simdgroup_load(mq, sq + 8 * i, DIM);
+                simdgroup_load(mk, pkb + 8 * i, width, 0, true);
+                simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+            }
+            simdgroup_store(mqk, ss + kb * 8, C);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* online softmax; simdgroup sg owns query slots sg and sg + NSG */
+        for (short jj = 0; jj < NQ; ++jj) {
+            const short j = jj * NSG + simdgroup;
+            const uint qpos = p.pos0 + iq1 + j / G;
+            const uint kpos = base + 2 * lane;
+            float2 logits = ss2[j * C / 2 + lane] * rsqrt(128.f);
+            if (kpos >= base + keys_here || kpos > qpos) logits[0] = -INFINITY;
+            if (kpos + 1 >= base + keys_here || kpos + 1 > qpos) logits[1] = -INFINITY;
+            const float old_maximum = maximums[jj];
+            maximums[jj] = simd_max(max(old_maximum, max(logits[0], logits[1])));
+            const float old_scale = exp(old_maximum - maximums[jj]);
+            const float2 weights = exp(logits - maximums[jj]);
+            sums[jj] = sums[jj] * old_scale + simd_sum(weights[0] + weights[1]);
+            ss2[j * C / 2 + lane] = weights;
+            so4[j * DV4 + lane] *= old_scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* O += W V: simdgroup sg owns output columns [32 sg, 32 sg + 32) */
+        const short key_blocks = (keys_here + 7) / 8;
+        for (short t = 0; t < TILES; ++t) {
+            const short col = (simdgroup * TILES + t) * 8;
+            simdgroup_float8x8 mo, mw, mv;
+            simdgroup_load(mo, so + col, DIM);
+            for (short kb = 0; kb < key_blocks; ++kb) {
+                simdgroup_load(mw, ss + kb * 8, C);
+                if ((kb + 1) * 8 <= (short)keys_here) {
+                    simdgroup_load(mv, pv + (uint64_t)kb * 8 * width + col, width);
+                } else {
+                    /* partial block: zero V rows that were never written (0 * NaN) */
+                    for (short e = lane; e < 64; e += 32) {
+                        short key = kb * 8 + e / 8;
+                        sv[e] = key < (short)keys_here ? pv[(uint64_t)key * width + col + e % 8] : 0.f;
+                    }
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                    simdgroup_load(mv, sv, 8);
+                }
+                simdgroup_multiply_accumulate(mo, mw, mv, mo);
+            }
+            simdgroup_store(mo, so + col, DIM);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (short jj = 0; jj < NQ; ++jj) {
+        const short j = jj * NSG + simdgroup;
+        const uint row = iq1 + j / G, head = head0 + j % G;
+        if (row >= p.rows) continue;
+        ((device float4 *)out)[(row * p.heads + head) * DV4 + lane] = so4[j * DV4 + lane] / sums[jj];
+    }
+}
+
 kernel void add_inplace(device float *x [[buffer(0)]], device const float *y [[buffer(1)]], constant uint &n [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i < n) x[i] += y[i]; }
 kernel void swiglu(device float *gate [[buffer(0)]], device const float *up [[buffer(1)]], constant uint &n [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i < n) { float x=gate[i]; gate[i]=(x/(1.0f+exp(-x)))*up[i]; } }
 

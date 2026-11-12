@@ -9,6 +9,7 @@ models/
 /bench-prefill
 /check-ref
 /check-rewind
+/check-attn
 /gguf-inspect
 /llama-ref
 /test_gguf

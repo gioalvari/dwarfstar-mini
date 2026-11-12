@@ -3,7 +3,7 @@ CFLAGS := -O3 -mcpu=native -std=c11 -Wall -Wextra -Wpedantic -Isrc
 LDFLAGS := -lm -lpthread -framework Metal -framework Foundation
 SRC := src/gguf.c src/quants.c src/model.c src/tokenizer.c src/forward.c src/sampler.c src/json.c src/server.c src/metal.m
 
-.PHONY: all clean test check-quants check-metal-gemv check-prefill check-rewind bench-prefill llama-ref check-ref
+.PHONY: all clean test check-quants check-metal-gemv check-prefill check-rewind check-attn bench-prefill llama-ref check-ref
 all: dsm
 dsm: $(SRC) src/main.c metal/dsm.metal
 	$(CC) $(CFLAGS) -o $@ $(SRC) src/main.c $(LDFLAGS)
@@ -27,6 +27,8 @@ check-prefill: tools/prefill_check.c $(SRC) metal/dsm.metal
 	$(CC) $(CFLAGS) -o $@ tools/prefill_check.c $(SRC) $(LDFLAGS)
 check-rewind: tools/rewind_check.c $(SRC) metal/dsm.metal
 	$(CC) $(CFLAGS) -o $@ tools/rewind_check.c $(SRC) $(LDFLAGS)
+check-attn: tools/attn_check.m metal/dsm.metal
+	$(CC) -O2 -fobjc-arc -Wall -o $@ tools/attn_check.m -framework Metal -framework Foundation
 bench-prefill: tools/prefill_bench.c $(SRC) metal/dsm.metal
 	$(CC) $(CFLAGS) -o $@ tools/prefill_bench.c $(SRC) $(LDFLAGS)
 llama-ref: tools/llama_ref.c
@@ -34,4 +36,4 @@ llama-ref: tools/llama_ref.c
 check-ref: tools/ref_check.c $(SRC) metal/dsm.metal
 	$(CC) $(CFLAGS) -o $@ tools/ref_check.c $(SRC) $(LDFLAGS)
 clean:
-	rm -f dsm test_gguf test_quants test_server_parse check-quants check-metal-gemv check-prefill check-rewind bench-prefill llama-ref check-ref
+	rm -f dsm test_gguf test_quants test_server_parse check-quants check-metal-gemv check-prefill check-rewind check-attn bench-prefill llama-ref check-ref
