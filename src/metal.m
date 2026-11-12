@@ -1590,3 +1590,20 @@ int dsm_metal_prefill(dsm_metal *s, const int32_t *tokens, uint32_t n,
 int dsm_metal_token(dsm_metal *s,int32_t token,float *logits){const dsm_model *m=s->m;if(token<0||(uint32_t)token>=m->vocab||s->pos>=s->context)return 0;const ggml_type_info *info=gguf_type_info(m->token_embd->type);const uint8_t *row=(const uint8_t *)m->token_embd->data+(uint64_t)token*(m->dim/info->block_elems)*info->block_bytes;float *x=s->x.contents;dsm_dequant_row(m->token_embd->type,row,x,m->dim);if(s->profile.enabled&&!qwen35_arch(m))return profile_token(s,logits);
     if(qwen35_arch(m)){if(getenv("DSM_DUMP_DIR")){for(uint32_t l=0;l<m->layers;++l){id<MTLCommandBuffer> cb=[s->queue commandBuffer];id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];encode_layer_hybrid(s,e,l);[e endEncoding];[cb commit];[cb waitUntilCompleted];if(cb.status!=MTLCommandBufferStatusCompleted)return 0;dump_hybrid_layer(s,l);}id<MTLCommandBuffer> cb=[s->queue commandBuffer];id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];encode_norm(s,e,s->x,m->output_norm,s->norm_x,m->dim,1);encode_gemv(s,e,m->output,s->norm_x,s->logits);[e endEncoding];[cb commit];[cb waitUntilCompleted];if(cb.status!=MTLCommandBufferStatusCompleted)return 0;}else{id<MTLCommandBuffer> cb=[s->queue commandBuffer];id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];for(uint32_t l=0;l<m->layers;++l)encode_layer_hybrid(s,e,l);encode_norm(s,e,s->x,m->output_norm,s->norm_x,m->dim,1);encode_gemv(s,e,m->output,s->norm_x,s->logits);[e endEncoding];[cb commit];[cb waitUntilCompleted];if(cb.status!=MTLCommandBufferStatusCompleted)return 0;}memcpy(logits,s->logits.contents,m->vocab*4);++s->pos;return 1;}
     id<MTLCommandBuffer> cb=[s->queue commandBuffer];id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];for(uint32_t l=0;l<m->layers;++l)encode_layer(s,e,l);if(!s->decode_fuse||m->is_moe)encode_norm(s,e,s->x,m->output_norm,s->norm_x,m->dim,1);encode_gemv(s,e,m->output,s->norm_x,s->logits);[e endEncoding];[cb commit];[cb waitUntilCompleted];if(cb.status!=MTLCommandBufferStatusCompleted)return 0;memcpy(logits,s->logits.contents,m->vocab*4);++s->pos;return 1;}
+
+double dsm_metal_gemv_bench(dsm_metal *s, const gguf_tensor *w, int reps) {
+    uint32_t rows = w->ndim > 1 ? (uint32_t)w->dims[1] : 1;
+    id<MTLBuffer> x = buffer(s->device, w->dims[0] * sizeof(float));
+    id<MTLBuffer> y = buffer(s->device, (uint64_t)rows * sizeof(float));
+    if (!x || !y || reps < 1) return -1.0;
+    float *input = x.contents;
+    for (uint64_t i = 0; i < w->dims[0]; ++i) input[i] = 0.001f * (float)(i % 97);
+    id<MTLCommandBuffer> cb = [s->queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    for (int rep = 0; rep < reps; ++rep) encode_gemv(s, e, w, x, y);
+    [e endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    return cb.status == MTLCommandBufferStatusCompleted
+                   ? cb.GPUEndTime - cb.GPUStartTime : -1.0;
+}
