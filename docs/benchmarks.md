@@ -28,7 +28,7 @@ Qwen3.6 short-prefill result ranged from 624 to 693 tokens/s.
 - [F4b](history/F4b.md) added Qwen3 MoE support.
 - [F5](history/F5.md) added the OpenAI-compatible server.
 - [F6](history/F6-plan.md) added batched prefill and `mul_mm` paths.
-- [F7](history/F7-plan.md) added hybrid Qwen3.5 models and checkpoint reuse.
+- [F7](history/F7-plan.md) added the hybrid Qwen3.6 and Qwen3.8 models and checkpoint reuse.
 - [F8](history/F8.md) added flash attention and the current Qwen3 results.
 
 The full development-note index is in [history](history/README.md).

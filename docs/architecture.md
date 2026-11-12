@@ -10,9 +10,10 @@ attention layers.
 
 The tokenizer reads the token and merge data in the GGUF file and applies the
 Qwen byte-BPE tokenizer. `--chat` renders a user turn in ChatML form. The
-server renders chat messages and tool calls in the Qwen template. Qwen3.5
-generation starts with its thinking marker and removes reasoning from earlier
-assistant turns when it rebuilds a prompt.
+server renders chat messages and tool calls in the Qwen template. For the
+hybrid models (Qwen3.6, Qwen3.8), generation starts with the thinking marker,
+and the server removes reasoning from earlier assistant turns when it rebuilds
+a prompt.
 
 ## CPU reference
 
@@ -38,8 +39,8 @@ products and `mul_mm_id` handles routed expert products. Long prompts are
 split into chunks. The prefill attention path uses tiled and flash-attention
 kernels where their supported head dimensions apply.
 
-For Qwen3.5 models, recurrent layers carry Gated DeltaNet state and convolution
-history alongside the attention KV cache. The server stores checkpoints of that
+For the hybrid models (`qwen35`, `qwen35moe`), recurrent layers carry Gated
+DeltaNet state and convolution history alongside the attention KV cache. The server stores checkpoints of that
 state. On a shared chat prefix, it rewinds to the newest usable checkpoint and
 prefills only the remaining tokens.
 
