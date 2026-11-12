@@ -37,6 +37,34 @@ Details, correctness gates and history: `docs/F6-plan.md` (batched prefill),
 `docs/F7-plan.md` (qwen35 / qwen35moe) and `docs/F8.md` (qwen3 prefill and
 decode against llama.cpp).
 
+## Model quality
+
+Capabilities from the vendor model cards (BF16) and perplexity measured on
+this machine (llama.cpp `llama-perplexity`, WikiText-2, context 512, 32
+chunks). Perplexity is only comparable between models with the same
+tokenizer.
+
+| Model | GPQA | LiveCodeBench v6 | PPL (local) | DSM decode |
+|---|---|---|---|---|
+| Qwen3.8-27B Q4_K_M | 89.2 (Diamond) | 90.3 | 5.61 | 11.3 tok/s |
+| Qwen3.6-35B-A3B UD-Q4_K_S | 86.0 | 80.4 | 5.46 | 55.4 tok/s |
+| Qwen3-30B-A3B (original April release) | 65.8 | 57.4 | 7.68 (Qwen3 tokenizer) | 64.7 tok/s |
+| Qwen3-1.7B | 40.1 | - | 14.53 (BF16) | 95.7 tok/s (Q8_0) |
+
+Quantization loss measured locally on Qwen3-1.7B against BF16:
+
+| Weights | PPL | KLD vs BF16 | Same top-1 token |
+|---|---|---|---|
+| Q8_0 | 14.62 (+0.6%) | 0.0025 | 98.0% |
+| Q5_K_M (requantized from Q8_0) | 14.68 (+1.0%) | 0.032 | 92.7% |
+| Q4_K_M | 15.78 (+8.6%) | 0.099 | 87.7% |
+| Q2_K | 144.6 (×10) | 2.55 | 46.4% |
+
+Larger models lose much less: published runs give Qwen3.8-27B Q4_K_M a KLD of
+0.014 against BF16 (same top-1 95.0%; Q8_0: 0.0009, 98.7%). Locally,
+Qwen3.6 UD-Q4_K_S and UD-Q4_K_M are equivalent (KLD 0.0098 between them).
+Full tables, Artificial Analysis comparison and sources: `docs/quality.md`.
+
 ## Build and run
 
 ```sh
