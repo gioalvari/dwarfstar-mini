@@ -1165,6 +1165,50 @@ kernel void rope_neox(device float *x [[buffer(0)]], constant Rope &p [[buffer(1
     float a = x[base + i], b = x[base + i + p.dim / 2]; x[base + i] = a * c - b * s; x[base + i + p.dim / 2] = a * s + b * c;
 }
 
+struct QkNormRope { uint heads, kv_heads, dim, pos, context, layer; float base, eps; };
+
+kernel void qk_norm_rope(device float *q [[buffer(0)]], device float *k [[buffer(1)]],
+                          device const float *q_weight [[buffer(2)]],
+                          device const float *k_weight [[buffer(3)]],
+                          device float *keys [[buffer(4)]],
+                          constant QkNormRope &p [[buffer(5)]],
+                          ushort tid [[thread_index_in_threadgroup]],
+                          uint group [[threadgroup_position_in_grid]],
+                          threadgroup float *sum [[threadgroup(0)]]) {
+    bool is_k = group >= p.heads;
+    uint head = is_k ? group - p.heads : group;
+    if (head >= (is_k ? p.kv_heads : p.heads)) return;
+    device float *x = (is_k ? k : q) + head * p.dim;
+    device const float *weight = is_k ? k_weight : q_weight;
+    float v = 0.0f;
+    for (uint i = tid; i < p.dim; i += 256) v += x[i] * x[i];
+    sum[tid] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) {
+        if (tid < step) sum[tid] += sum[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float scale = rsqrt(sum[0] / float(p.dim) + p.eps);
+    uint pairs = p.dim / 2;
+    if (tid < pairs) {
+        uint i = tid;
+        float theta = float(p.pos) / pow(p.base, float(i) / float(pairs));
+        float c = cos(theta), s = sin(theta);
+        float a = x[i] * scale * weight[i];
+        float b = x[i + pairs] * scale * weight[i + pairs];
+        float lo = a * c - b * s;
+        float hi = a * s + b * c;
+        x[i] = lo;
+        x[i + pairs] = hi;
+        if (is_k) {
+            device float *out = keys +
+                    ((p.layer * p.context + p.pos) * p.kv_heads + head) * p.dim;
+            out[i] = lo;
+            out[i + pairs] = hi;
+        }
+    }
+}
+
 kernel void rope_neox_batch(device float *x [[buffer(0)]], constant RopeBatch &p [[buffer(1)]], uint index [[thread_position_in_grid]]) {
     uint per_row = p.heads * (p.dim / 2);
     uint total = p.rows * per_row;
@@ -1895,6 +1939,25 @@ kernel void attention_prefill_fa128(device const float *q [[buffer(0)]],
 }
 
 kernel void add_inplace(device float *x [[buffer(0)]], device const float *y [[buffer(1)]], constant uint &n [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i < n) x[i] += y[i]; }
+kernel void add_rmsnorm(device float *x [[buffer(0)]], device const float *y [[buffer(1)]],
+                        device const float *weight [[buffer(2)]], device float *out [[buffer(3)]],
+                        constant Norm &p [[buffer(4)]], ushort tid [[thread_index_in_threadgroup]],
+                        threadgroup float *sum [[threadgroup(0)]]) {
+    for (uint i = tid; i < p.width; i += 256) {
+        x[i] = x[i] + y[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float v = 0.0f;
+    for (uint i = tid; i < p.width; i += 256) v += x[i] * x[i];
+    sum[tid] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) {
+        if (tid < step) sum[tid] += sum[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float scale = rsqrt(sum[0] / float(p.width) + p.eps);
+    for (uint i = tid; i < p.width; i += 256) out[i] = x[i] * scale * weight[i];
+}
 kernel void swiglu(device float *gate [[buffer(0)]], device const float *up [[buffer(1)]], constant uint &n [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i < n) { float x=gate[i]; gate[i]=(x/(1.0f+exp(-x)))*up[i]; } }
 
 struct ExpertGemv { uint in, out, expert_stride, out_stride, input_stride; };
