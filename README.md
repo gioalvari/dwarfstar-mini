@@ -1,83 +1,122 @@
 # dwarfstar-mini
 
-Minimal C + Metal LLM inference engine for Apple Silicon, inspired by
-[antirez/ds4](https://github.com/antirez/ds4). Target: M4 Pro 48 GB.
+## What it is
 
-## Supported models
+dwarfstar-mini is a small C and Objective-C/Metal GGUF inference engine for
+Apple Silicon. It is for people who want a readable local engine and a direct
+comparison point for llama.cpp. It exists to show a small engine can match
+llama.cpp speed on measured Qwen3 and Qwen3.6 decode workloads on a Mac.
+
+## Highlights
+
+- Qwen3.6-35B-A3B UD-Q4_K_S measured 55.4 tokens/s decode.
+- Qwen3.8-27B Q4_K_M measured 11.3 tokens/s decode.
+- Qwen3-1.7B Q4_K_M measured 1670 tokens/s at 570-token prefill.
+- The server reuses chat prefixes with Metal state checkpoints.
+
+## Requirements
+
+- An Apple Silicon Mac with Metal.
+- macOS with the Metal APIs used by your Xcode command line tools. macOS 15 adds
+  an optional `MTLResidencySet` optimization; it is not required.
+- Xcode command line tools: `xcode-select --install`.
+
+## Quickstart
+
+```sh
+git clone https://github.com/gioalvari/dwarfstar-mini.git
+cd dwarfstar-mini
+make
+mkdir -p models
+```
+
+Download the small Qwen3 model. Check the URL and its final content length
+first, then download it.
+
+```sh
+URL='https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf'
+curl -sIL "$URL" | grep -i '^content-length\|^HTTP'
+curl -L "$URL" -o models/Qwen3-1.7B-Q8_0.gguf
+```
+
+Other tested downloads:
+
+```sh
+URL='https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_S.gguf'
+curl -sIL "$URL" | grep -i '^content-length\|^HTTP'
+URL='https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-Q4_K_M.gguf'
+curl -sIL "$URL" | grep -i '^content-length\|^HTTP'
+```
+
+Run a prompt:
+
+```sh
+./dsm -m models/Qwen3-1.7B-Q8_0.gguf -p 'The capital of France is' -n 32 --temp 0
+```
+
+Start the local server and send a chat request:
+
+```sh
+./dsm serve -m models/Qwen3-1.7B-Q8_0.gguf --port 8080
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Say hello."}],"max_tokens":16}'
+```
+
+## Supported models and weight types
 
 | Architecture | Models tested | Notes |
 |---|---|---|
-| `qwen3` (dense) | Qwen3-1.7B Q2_K / Q4_K_M / Q5_K_M / Q8_0 | |
-| `qwen3moe` | Qwen3-30B-A3B, Qwen3-Coder-30B-A3B (asymmetric Q3_K/Q4_K experts, Q8_0) | OpenAI tool calls for the Coder chat template |
-| `qwen35moe` | Qwen3.6-35B-A3B UD-Q4_K_S / UD-Q4_K_M | Gated DeltaNet + gated attention, 256 experts |
-| `qwen35` (dense) | Qwen3.8-27B Q4_K_M | |
+| `qwen3` | Qwen3-1.7B Q2_K / Q4_K_M / Q5_K_M / Q8_0 | Dense |
+| `qwen3moe` | Qwen3-30B-A3B, Qwen3-Coder-30B-A3B | Asymmetric Q3_K/Q4_K experts and Q8_0 tested |
+| `qwen35moe` | Qwen3.6-35B-A3B UD-Q4_K_S / UD-Q4_K_M | Hybrid Gated DeltaNet and attention |
+| `qwen35` | Qwen3.8-27B Q4_K_M | Hybrid dense |
 
-Supported weight types on Metal: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, F32.
-Decode, batched prefill (`mul_mm` / `mul_mm_id`), and the OpenAI-compatible
-server (`./dsm serve`) run on Metal. For the recurrent qwen35 models, the
-server reuses the prompt prefix through state checkpoints.
+Metal supports Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, and F32 weights.
 
-Speed on M4 Pro 48 GB (tok/s, warm, same session, 2026-11-12). DSM prefill
-uses 570- and 3990-token prompts; llama.cpp build 9860 uses
-`llama-bench -fa 1` pp512 / pp4096 / tg128:
+## Speed
 
-| Model | DSM pp570 | llama pp512 | DSM pp3990 | llama pp4096 | DSM decode | llama tg128 |
-|---|---|---|---|---|---|---|
-| Qwen3.6-35B-A3B UD-Q4_K_S | 674-693 | 719 | 522 | 351 | 55.4 | 55.6 |
-| Qwen3.6-35B-A3B UD-Q4_K_M | 614 | 778 | 541 | 367 | 49.9 | 54.3 |
-| Qwen3.8-27B Q4_K_M | 93-100 | 125.5 | - | - | 11.3 | 11.5 |
-| Qwen3-30B-A3B asym | 680 | 828 | 355 | ~473 | 64.7 | 63.2 |
-| Qwen3-1.7B Q4_K_M | 1670 | 2048 | 1222 | 1735 | 136 | 149.5 |
-| Qwen3-1.7B Q5_K_M | 1568 | 1909 | 1176 | 1641 | 113.8 | 125.2 |
-| Qwen3-1.7B Q8_0 | 1784 | 2126 | 1275 | 1803 | 95.7 | 103.0 |
+M4 Pro 48 GB, warm tokens/s:
 
-The 27B row is from 2026-11-09 (`docs/F7-plan.md`, Result 5).
+| Model | DSM prefill | DSM decode | llama.cpp decode |
+|---|---:|---:|---:|
+| Qwen3.6-35B-A3B UD-Q4_K_S | 674-693 | 55.4 | 55.6 |
+| Qwen3.8-27B Q4_K_M | 93-100 | 11.3 | 11.5 |
+| Qwen3-1.7B Q4_K_M | 1670 | 136 | 149.5 |
 
-Details, correctness gates and history: `docs/F6-plan.md` (batched prefill),
-`docs/F7-plan.md` (qwen35 / qwen35moe) and `docs/F8.md` (qwen3 prefill and
-decode against llama.cpp).
+See [benchmark methodology and the full table](docs/benchmarks.md).
 
 ## Model quality
 
-Capabilities from the vendor model cards (BF16) and perplexity measured on
-this machine (llama.cpp `llama-perplexity`, WikiText-2, context 512, 32
-chunks). Perplexity is only comparable between models with the same
-tokenizer.
+Quantization changes output quality. The local perplexity, KLD, and published
+model-quality tables are in [docs/quality.md](docs/quality.md).
 
-| Model | GPQA | LiveCodeBench v6 | PPL (local) | DSM decode |
-|---|---|---|---|---|
-| Qwen3.8-27B Q4_K_M | 89.2 (Diamond) | 90.3 | 5.61 | 11.3 tok/s |
-| Qwen3.6-35B-A3B UD-Q4_K_S | 86.0 | 80.4 | 5.46 | 55.4 tok/s |
-| Qwen3-30B-A3B (original April release) | 65.8 | 57.4 | 7.68 (Qwen3 tokenizer) | 64.7 tok/s |
-| Qwen3-1.7B | 40.1 | - | 14.53 (BF16) | 95.7 tok/s (Q8_0) |
+## Limitations
 
-Quantization loss measured locally on Qwen3-1.7B against BF16:
+- Apple Silicon only.
+- Only the listed architectures and weight types are supported.
+- The KV cache is F32.
+- Vision and MTP tensors are not evaluated.
+- The server handles one request at a time.
+- The server accepts chat completions, not text completions or embeddings.
+- Chat sampling supports `temperature` and `top_p`; it does not expose other
+  sampling parameters.
 
-| Weights | PPL | KLD vs BF16 | Same top-1 token |
-|---|---|---|---|
-| Q8_0 | 14.62 (+0.6%) | 0.0025 | 98.0% |
-| Q5_K_M (requantized from Q8_0) | 14.68 (+1.0%) | 0.032 | 92.7% |
-| Q4_K_M | 15.78 (+8.6%) | 0.099 | 87.7% |
-| Q2_K | 144.6 (×10) | 2.55 | 46.4% |
+## Docs
 
-Larger models lose much less: published runs give Qwen3.8-27B Q4_K_M a KLD of
-0.014 against BF16 (same top-1 95.0%; Q8_0: 0.0009, 98.7%). Locally,
-Qwen3.6 UD-Q4_K_S and UD-Q4_K_M are equivalent (KLD 0.0098 between them).
-Full tables, Artificial Analysis comparison and sources: `docs/quality.md`.
+- [Architecture](docs/architecture.md)
+- [Benchmarks](docs/benchmarks.md)
+- [Model quality](docs/quality.md)
+- [Configuration](docs/configuration.md)
+- [Development history](docs/history/README.md)
 
-## Build and run
+## Development
 
-```sh
-make dsm
-./dsm -m models/Qwen3-1.7B-Q4_K_M.gguf -p 'The capital of France is' -n 32 --temp 0
-./dsm serve -m models/Qwen3.6-35B-A3B-UD-Q4_K_S.gguf --port 8080 --ctx 32768
-make test
-```
+Run unit tests with `make test`. Model-dependent verification targets are
+`check-prefill`, `check-ref`, `check-rewind`, `check-metal-gemv`, `check-attn`,
+`bench-prefill`, and `bench-gemv`.
 
-Models are not committed (`models/` is ignored). Validation tools:
-`check-metal-gemv`, `check-prefill`, `check-rewind`, `bench-prefill`, and
-`llama-ref` / `check-ref` for logit comparison against llama.cpp (built
-against the Homebrew `llama.cpp`).
+## License and acknowledgements
 
-Metal GEMV, `mul_mm` and attention kernel ports include code from llama.cpp,
-licensed under MIT (see `NOTICE`).
+MIT. Metal kernels are derived from llama.cpp/ggml under MIT; see [NOTICE](NOTICE).
+The project is inspired by [antirez/ds4](https://github.com/antirez/ds4).
