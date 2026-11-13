@@ -1468,17 +1468,32 @@ kernel void shexp_add(device float *x [[buffer(0)]], device const float *shared 
     if (index < n) x[index] += shared[index] / (1.0f + exp(-gate[0]));
 }
 
-kernel void cache_write(device const float *src [[buffer(0)]], device float *cache [[buffer(1)]], constant Cache &p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
-    if (i < p.width) cache[((p.layer * p.context + p.pos) * p.width) + i] = src[i];
+template<typename T>
+kernel void cache_write_impl(device const float *src [[buffer(0)]], device T *cache [[buffer(1)]],
+                             constant Cache &p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i < p.width) cache[((p.layer * p.context + p.pos) * p.width) + i] = T(src[i]);
 }
 
-kernel void cache_write_batch(device const float *src [[buffer(0)]], device float *cache [[buffer(1)]], constant CacheBatch &p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+template<typename T>
+kernel void cache_write_batch_impl(device const float *src [[buffer(0)]],
+                                   device T *cache [[buffer(1)]],
+                                   constant CacheBatch &p [[buffer(2)]],
+                                   uint i [[thread_position_in_grid]]) {
     uint total = p.rows * p.width;
     if (i >= total) return;
     uint row = i / p.width;
     uint col = i % p.width;
-    cache[((p.layer * p.context + p.pos0 + row) * p.width) + col] = src[i];
+    cache[((p.layer * p.context + p.pos0 + row) * p.width) + col] = T(src[i]);
 }
+
+template [[host_name("cache_write")]] kernel void cache_write_impl<float>(
+    device const float *, device float *, constant Cache &, uint);
+template [[host_name("cache_write_f16")]] kernel void cache_write_impl<half>(
+    device const float *, device half *, constant Cache &, uint);
+template [[host_name("cache_write_batch")]] kernel void cache_write_batch_impl<float>(
+    device const float *, device float *, constant CacheBatch &, uint);
+template [[host_name("cache_write_batch_f16")]] kernel void cache_write_batch_impl<half>(
+    device const float *, device half *, constant CacheBatch &, uint);
 
 kernel void attention_decode(device const float *q [[buffer(0)]], device const float *keys [[buffer(1)]],
                               device const float *values [[buffer(2)]], device float *out [[buffer(3)]],

@@ -106,6 +106,11 @@ int dsm_mtl_attention_flash_enabled(void) {
 int dsm_mtl_qwen35_arch(const dsm_model *m) {
     return m->arch == DSM_ARCH_QWEN35 || m->arch == DSM_ARCH_QWEN35MOE;
 }
+uint64_t dsm_metal_kv_bytes(const dsm_metal *s) {
+    if (!s)
+        return 0;
+    return s->keys.length + s->values.length;
+}
 static uint32_t checkpoint_ring_size(void) {
     const char *value = getenv("DSM_CKPT");
     char *end = NULL;
@@ -251,6 +256,10 @@ int dsm_metal_init(dsm_metal **out, const dsm_model *m, uint32_t context, char *
     }
     s->m = m;
     s->context = context;
+    s->kv_f16 = getenv("DSM_KV_F16") && !strcmp(getenv("DSM_KV_F16"), "1");
+    if (getenv("DSM_KV_F32") && !strcmp(getenv("DSM_KV_F32"), "1"))
+        s->kv_f16 = 0;
+    s->kv_bytes = s->kv_f16 ? sizeof(uint16_t) : sizeof(float);
     s->profile.enabled = getenv("DSM_PROFILE") && !strcmp(getenv("DSM_PROFILE"), "1");
     s->device = MTLCreateSystemDefaultDevice();
     if (!s->device) {
@@ -312,6 +321,7 @@ int dsm_metal_init(dsm_metal **out, const dsm_model *m, uint32_t context, char *
         {offsetof(struct dsm_metal, gdn_gates_batch), @"gdn_gates_batch"},
         {offsetof(struct dsm_metal, gdn_batch), @"gated_delta_net_batch"},
         {offsetof(struct dsm_metal, cache), @"cache_write"},
+        {offsetof(struct dsm_metal, cache_f16), @"cache_write_f16"},
         {offsetof(struct dsm_metal, attention), @"attention_decode"},
         {offsetof(struct dsm_metal, attention_split), @"attention_decode_split"},
         {offsetof(struct dsm_metal, attention_merge), @"attention_decode_merge"},
@@ -331,6 +341,7 @@ int dsm_metal_init(dsm_metal **out, const dsm_model *m, uint32_t context, char *
         {offsetof(struct dsm_metal, rope_batch), @"rope_neox_batch"},
         {offsetof(struct dsm_metal, rope_partial_batch), @"rope_neox_partial_batch"},
         {offsetof(struct dsm_metal, cache_batch), @"cache_write_batch"},
+        {offsetof(struct dsm_metal, cache_batch_f16), @"cache_write_batch_f16"},
         {offsetof(struct dsm_metal, attention_prefill), @"attention_prefill"},
         {offsetof(struct dsm_metal, attention_prefill_d256), @"attention_prefill_d256"},
         {offsetof(struct dsm_metal, attention_prefill_d128_tiled), @"attention_prefill_d128_tiled"},
@@ -368,6 +379,10 @@ int dsm_metal_init(dsm_metal **out, const dsm_model *m, uint32_t context, char *
     if (!create_pipelines(s, lib, specs, sizeof(specs) / sizeof(*specs), error, error_size)) {
         goto bad;
     }
+    if (s->kv_f16) {
+        set_error(error, error_size, "F16 KV not supported for this path yet");
+        goto bad;
+    }
     const char *mmf_env = getenv("DSM_MM_F32");
     s->mm_f32 = mmf_env ? strcmp(mmf_env, "0") != 0 : dsm_mtl_qwen35_arch(m);
     s->mm_f32w_enabled = f32_weight_matmul_enabled();
@@ -379,7 +394,7 @@ int dsm_metal_init(dsm_metal **out, const dsm_model *m, uint32_t context, char *
              slots = m->is_moe ? m->experts_used : 1,
              context_alloc = (context + 63) & ~UINT32_C(63);
     uint64_t kv = (uint64_t)(dsm_mtl_qwen35_arch(m) ? m->n_attn_layers : m->layers) *
-                  context_alloc * m->kv_heads * m->key_dim * 4;
+                  context_alloc * m->kv_heads * m->key_dim * s->kv_bytes;
     s->x = dsm_mtl_buffer(s->device, m->dim * 4);
     s->norm_x = dsm_mtl_buffer(s->device, m->dim * 4);
     s->q = dsm_mtl_buffer(s->device, m->q_width * 4);

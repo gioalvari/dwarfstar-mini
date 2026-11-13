@@ -151,13 +151,15 @@ struct dsm_metal {
     id<MTLCommandQueue> queue;
     id<MTLResidencySet> residency;
     id<MTLComputePipelineState> q8, q2k, q3k, q4k, q5k, q6k, f32, norm, rope, rope_partial, cache,
+        cache_f16,
         attention, attention_split, attention_merge, add, add_rmsnorm, qk_norm_rope, swiglu,
         route_topk, expert_q8, expert_q8_fast, expert_q3k, expert_q4k, expert_q5k, expert_q6k,
         expert_swiglu, moe_add;
     id<MTLComputePipelineState> split_q_gate, split_gdn_qk, l2norm, ssm_conv, gdn_gates, gdn,
         gated_rmsnorm, sigmoid_mul, shexp_add, f32_rows, shexp_add_batch;
     id<MTLComputePipelineState> ssm_conv_batch, split_gdn_qk_batch, gdn_gates_batch, gdn_batch;
-    id<MTLComputePipelineState> rope_batch, rope_partial_batch, cache_batch, attention_prefill,
+    id<MTLComputePipelineState> rope_batch, rope_partial_batch, cache_batch, cache_batch_f16,
+        attention_prefill,
         attention_prefill_d256, attention_prefill_d128_tiled, attention_prefill_fa128,
         moe_add_batch;
     id<MTLComputePipelineState> mm_q8, mm_q2k, mm_q3k, mm_q4k, mm_q5k, mm_q6k, mm_id_map0, mm_id_q8,
@@ -174,7 +176,8 @@ struct dsm_metal {
         mm_id_hids;
     id<MTLBuffer> hb_qkv, hb_conv, hb_dq, hb_dk, hb_z, hb_g, hb_beta, hb_mix, hb_qg, hb_aq,
         hb_agate, hb_ak, hb_av, hb_out, hb_shg, hb_sgate, hb_sup, hb_sdown;
-    uint32_t batch_chunk;
+    uint32_t batch_chunk, kv_bytes;
+    int kv_f16;
     recurrent_checkpoint *checkpoints;
     uint32_t checkpoint_count, checkpoint_next;
     dsm_metal_profile profile;
