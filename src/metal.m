@@ -1471,15 +1471,15 @@ static void encode_hybrid_moe_batch(dsm_metal *s, id<MTLComputeCommandEncoder> e
                          m->experts);
     encode_moe_topk_batch(s, e, rows); }
     if (ST(5)) {
-    static int parts = -1; if (parts < 0) parts = getenv("DSM_EXP_PARTS") ? atoi(getenv("DSM_EXP_PARTS")) : 31;
     int use_mm_id = mul_mm_id_enabled() && rows > 8;
-    static int dup = -1; if (dup < 0) dup = getenv("DSM_EXP_DUP") ? atoi(getenv("DSM_EXP_DUP")) : 0;
-    int map = 1;
-    if (use_mm_id && (parts & 1)) { use_mm_id = encode_expert_matmul(s, e, w->gate_exps, s->bnorm, s->bgate, rows, 1, m->dim, m->expert_hidden, map); map = 0; }
-    if (use_mm_id && (dup & 1)) encode_expert_matmul(s, e, w->gate_exps, s->bnorm, s->bgate, rows, 1, m->dim, m->expert_hidden, 0);
-    if (use_mm_id && (parts & 2)) { use_mm_id = encode_expert_matmul(s, e, w->up_exps, s->bnorm, s->bup, rows, 1, m->dim, m->expert_hidden, map); map = 0; }
-    if (use_mm_id && (dup & 2)) encode_expert_matmul(s, e, w->up_exps, s->bnorm, s->bup, rows, 1, m->dim, m->expert_hidden, 0);
-    if (use_mm_id && (parts & 4)) {
+    /* The first expert matmul builds the token-to-expert map; the others reuse it. */
+    if (use_mm_id)
+        use_mm_id = encode_expert_matmul(s, e, w->gate_exps, s->bnorm, s->bgate, rows, 1,
+                                         m->dim, m->expert_hidden, 1);
+    if (use_mm_id)
+        use_mm_id = encode_expert_matmul(s, e, w->up_exps, s->bnorm, s->bup, rows, 1,
+                                         m->dim, m->expert_hidden, 0);
+    if (use_mm_id) {
         [e setComputePipelineState:s->expert_swiglu];
         [e setBuffer:s->bgate offset:0 atIndex:0]; [e setBuffer:s->bup offset:0 atIndex:1];
         [e setBytes:&m->expert_hidden length:sizeof(m->expert_hidden) atIndex:2];
@@ -1487,11 +1487,9 @@ static void encode_hybrid_moe_batch(dsm_metal *s, id<MTLComputeCommandEncoder> e
         [e setBytes:&rows length:sizeof(rows) atIndex:4];
         dispatch_1d(e, s->expert_swiglu, rows * m->expert_hidden * m->experts_used);
     }
-    if (use_mm_id && (parts & 8)) use_mm_id = encode_expert_matmul(s, e, w->down_exps, s->bgate, s->btmp,
-                                         rows, m->experts_used, m->expert_hidden,
-                                         m->dim, map);
-    if (use_mm_id && (dup & 8)) encode_expert_matmul(s, e, w->down_exps, s->bgate, s->btmp, rows, m->experts_used, m->expert_hidden, m->dim, 0);
-    if (!(parts & 16)) return;
+    if (use_mm_id)
+        use_mm_id = encode_expert_matmul(s, e, w->down_exps, s->bgate, s->btmp, rows,
+                                         m->experts_used, m->expert_hidden, m->dim, 0);
     if (!use_mm_id) for (uint32_t row = 0; row < rows; ++row) {
         NSUInteger x_off = (NSUInteger)row * m->dim * sizeof(float);
         NSUInteger gate_off = (NSUInteger)row * m->experts_used * m->expert_hidden * sizeof(float);
