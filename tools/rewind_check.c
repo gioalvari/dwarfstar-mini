@@ -42,7 +42,7 @@ static int prefill(dsm_metal *metal, const int32_t *tokens, uint32_t n, float *l
 }
 static int greedy(dsm_metal *metal, float *logits, uint32_t vocab, int32_t *out) {
     dsm_sampler sampler;
-    dsm_sampler_init(&sampler, 0, 0.95f, 1);
+    dsm_sampler_init(&sampler, 0, 0.95f, 0, 0, 1, 0, 0);
     for (uint32_t i = 0; i < GREEDY_TOKENS; ++i) {
         out[i] = dsm_sample(&sampler, logits, vocab);
         if (!dsm_metal_token(metal, out[i], logits)) return 0;

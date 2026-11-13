@@ -655,12 +655,18 @@ static int generate(server *s, int fd, const dsm_json *root) {
   dsm_tool_call *calls = NULL;
   size_t call_count = 0;
   int tools_requested = 0;
+  dsm_sampler sampler = {0};
   const dsm_json *v = dsm_json_object_get(root, "max_completion_tokens");
   if (!v)
     v = dsm_json_object_get(root, "max_tokens");
   int max_tokens = v && v->type == DSM_JSON_NUMBER ? (int)v->number : 16;
   const dsm_json *temp_v = dsm_json_object_get(root, "temperature"),
                  *top_p_v = dsm_json_object_get(root, "top_p"),
+                 *top_k_v = dsm_json_object_get(root, "top_k"),
+                 *min_p_v = dsm_json_object_get(root, "min_p"),
+                 *seed_v = dsm_json_object_get(root, "seed"),
+                 *presence_v = dsm_json_object_get(root, "presence_penalty"),
+                 *frequency_v = dsm_json_object_get(root, "frequency_penalty"),
                  *stream_v = dsm_json_object_get(root, "stream"),
                  *stop_v = dsm_json_object_get(root, "stop");
   float temp =
@@ -668,6 +674,23 @@ static int generate(server *s, int fd, const dsm_json *root) {
   float top_p = top_p_v && top_p_v->type == DSM_JSON_NUMBER
                     ? (float)top_p_v->number
                     : 1.0f;
+  uint32_t top_k = top_k_v && top_k_v->type == DSM_JSON_NUMBER &&
+                           top_k_v->number > 0
+                       ? (uint32_t)top_k_v->number
+                       : 0;
+  float min_p = min_p_v && min_p_v->type == DSM_JSON_NUMBER
+                    ? (float)min_p_v->number
+                    : 0;
+  uint64_t seed = seed_v && seed_v->type == DSM_JSON_NUMBER &&
+                          seed_v->number > 0
+                      ? (uint64_t)seed_v->number
+                      : 1;
+  float presence_penalty = presence_v && presence_v->type == DSM_JSON_NUMBER
+                               ? (float)presence_v->number
+                               : 0;
+  float frequency_penalty = frequency_v && frequency_v->type == DSM_JSON_NUMBER
+                                ? (float)frequency_v->number
+                                : 0;
   int stream = stream_v && stream_v->type == DSM_JSON_BOOL && stream_v->boolean;
   if (max_tokens < 0 || !make_prompt(root, &prompt) ||
       !dsm_tokenize(s->tokenizer, prompt.data, 0, &tokens)) {
@@ -779,8 +802,8 @@ static int generate(server *s, int fd, const dsm_json *root) {
                           "no-cache\r\nConnection: close\r\n\r\n",
                           91))
     goto done;
-  dsm_sampler sampler;
-  dsm_sampler_init(&sampler, temp, top_p, 1);
+  dsm_sampler_init(&sampler, temp, top_p, top_k, min_p, seed,
+                   presence_penalty, frequency_penalty);
   double decode_started = now();
   int finish_length = 1, streaming_tool = 0;
   for (int i = 0; i < max_tokens; ++i) {
@@ -911,6 +934,7 @@ logged: {
   cache_tokens(s, &tokens, generated, generated_len);
 }
 done:
+  dsm_sampler_free(&sampler);
   dsm_tool_calls_free(calls, call_count);
   free(content);
   for (size_t i = 0; i < stop_count; ++i)

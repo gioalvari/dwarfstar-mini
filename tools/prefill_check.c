@@ -156,7 +156,7 @@ int main(int argc, char **argv) {
         goto done;
     }
     dsm_sampler sampler;
-    dsm_sampler_init(&sampler, 0.0f, 0.95f, 1);
+    dsm_sampler_init(&sampler, 0.0f, 0.95f, 0, 0, 1, 0, 0);
     for (uint32_t i = 0; i < GREEDY_TOKENS; ++i) {
         int32_t reference_token = dsm_sample(&sampler, reference, model.vocab);
         int32_t prefill_token = dsm_sample(&sampler, prefill, model.vocab);

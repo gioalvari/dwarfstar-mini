@@ -11,7 +11,7 @@
 #include <string.h>
 #include <time.h>
 
-static void usage(const char *argv0) { fprintf(stderr,"usage: %s -m MODEL -p PROMPT [-n N] [--backend metal|cpu] [--threads N] [--temp T] [--chat] [--dump-logits FILE] [--tokens-only]\n       %s -m MODEL --render-chat REQUEST.json\n       %s serve -m MODEL [--backend metal|cpu] [--host 127.0.0.1] [--port 8080] [--ctx N] [--threads N] [--alias NAME]\n",argv0,argv0,argv0); }
+static void usage(const char *argv0) { fprintf(stderr,"usage: %s -m MODEL -p PROMPT [-n N] [--backend metal|cpu] [--threads N] [--temp T] [--top-k K] [--top-p P] [--min-p P] [--seed N] [--chat] [--dump-logits FILE] [--tokens-only]\n       %s -m MODEL --render-chat REQUEST.json\n       %s serve -m MODEL [--backend metal|cpu] [--host 127.0.0.1] [--port 8080] [--ctx N] [--threads N] [--alias NAME]\n",argv0,argv0,argv0); }
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}
 typedef struct { char *data; size_t len, cap; } string;
 static int append(string *out, const char *text, size_t length) {
@@ -134,12 +134,18 @@ int main(int argc, char **argv) {
     const char *path = NULL, *prompt = NULL, *dump = NULL, *backend = NULL, *render_chat = NULL;
     int n = 16, chat = 0, tokens_only = 0;
     uint32_t threads = 8;
-    float temp = 0;
+    float temp = 0, top_p = 0.95f, min_p = 0;
+    uint32_t top_k = 0;
+    uint64_t seed = 1;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) path = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--top-k") && i + 1 < argc) top_k = (uint32_t)strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) top_p = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--min-p") && i + 1 < argc) min_p = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--backend") && i + 1 < argc) backend = argv[++i];
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--chat")) chat = 1;
@@ -202,9 +208,12 @@ int main(int argc, char **argv) {
     } else for (size_t i = 0; i < ids.len; ++i) if (!dsm_forward_token(f, ids.ids[i], logits)) { fprintf(stderr, "dsm: prompt inference failed\n"); return 1; }
     double prefill_elapsed = now() - prefill_started;
     if (dump) { FILE *fp = fopen(dump, "wb"); if (!fp || fwrite(logits, sizeof(*logits), model.vocab, fp) != model.vocab) { fprintf(stderr, "dsm: failed to write logits\n"); return 1; } fclose(fp); }
-    dsm_sampler sampler; dsm_sampler_init(&sampler, temp, 0.95f, 1); double decode_started = now(); int generated = 0;
+    dsm_sampler sampler;
+    dsm_sampler_init(&sampler, temp, top_p, top_k, min_p, seed, 0, 0);
+    double decode_started = now();
+    int generated = 0;
     for (int i = 0; i < n; ++i) { int32_t id = dsm_sample(&sampler, logits, model.vocab); if ((chat && dsm_token_is_im_end(tok, id)) || !dsm_token_decode(tok, id, stdout) || !(use_metal ? dsm_metal_token(metal, id, logits) : dsm_forward_token(f, id, logits))) break; ++generated; }
     double decode_elapsed = now() - decode_started;
     fprintf(stderr, "\ndsm: %s prefill %.2f tokens/s (%zu tokens, %.3f s); decode %.2f tokens/s (%d tokens, %.3f s)\n", use_metal ? "metal" : "cpu", ids.len / prefill_elapsed, ids.len, prefill_elapsed, generated / decode_elapsed, generated, decode_elapsed);
-    free(logits); dsm_forward_free(f); dsm_metal_free(metal); dsm_tokens_free(&ids); dsm_tokenizer_free(tok); dsm_model_close(&model); free(rendered); return 0;
+    dsm_sampler_free(&sampler); free(logits); dsm_forward_free(f); dsm_metal_free(metal); dsm_tokens_free(&ids); dsm_tokenizer_free(tok); dsm_model_close(&model); free(rendered); return 0;
 }

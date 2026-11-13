@@ -1,4 +1,5 @@
 #include "json.h"
+#include "sampler.h"
 #include "server.h"
 
 #include <stdio.h>
@@ -10,6 +11,15 @@ static int contains(const char *text, const char *part) {
 }
 
 int main(void) {
+    const float logits[] = {1.0f, 2.0f, 3.0f};
+    dsm_sampler sampler;
+    dsm_sampler_init(&sampler, 0.8f, 1.0f, 1, 0, 123, 0, 0);
+    if (dsm_sample(&sampler, logits, 3) != 2) {
+        fprintf(stderr, "top_k sampling failed\n");
+        dsm_sampler_free(&sampler);
+        return 1;
+    }
+    dsm_sampler_free(&sampler);
     const char *request =
         "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"description\":\"Read a file\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Path\"}}}}}],"
         "\"messages\":[{\"role\":\"user\",\"content\":\"Read README.md\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}]},{\"role\":\"tool\",\"content\":\"# dwarfstar-mini\"}]}";
