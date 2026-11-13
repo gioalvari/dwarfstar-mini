@@ -51,6 +51,7 @@ the slower path it replaced; leave them unset for normal use.
 | `DSM_STAGE_PROF` (any value) | off | per-stage GPU timings of Qwen3.6/Qwen3.8 batched prefill in `bench-prefill` | diagnostics |
 | `DSM_CKPT_PROFILE` (any value) | off | print size and copy time of each checkpoint | diagnostics |
 | `DSM_DUMP_DIR=DIR` | off | write per-layer hidden states of Qwen3.6/Qwen3.8 decode as `l_out-<layer>-<pos>.f32` (forces the token loop) | diagnostics |
+| `DSM_MAX_BUFFER_BYTES=N` | device limit | map the weights in Metal views of at most N bytes, so tensors cross view boundaries (`make check-views`) | test |
 
 `llama-ref` (a verification tool, not part of `dsm`) reads `REF_BATCH`
 (default 512; 1 runs llama.cpp token by token).

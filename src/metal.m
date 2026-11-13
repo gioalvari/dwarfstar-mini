@@ -575,6 +575,75 @@ static void encode_add_rmsnorm(dsm_metal *s, id<MTLComputeCommandEncoder> e,
 }
 
 int dsm_metal_available(void) { return MTLCreateSystemDefaultDevice() != nil; }
+static uint64_t max_buffer_bytes(id<MTLDevice> device) {
+    uint64_t max = [device maxBufferLength];
+    /* Test hook: smaller views make tensors straddle view boundaries (make check-views). */
+    const char *value = getenv("DSM_MAX_BUFFER_BYTES");
+    char *end = NULL;
+    unsigned long long cap = value ? strtoull(value, &end, 10) : 0;
+    if (value && *value && !*end && cap && cap < max) max = cap;
+    return max;
+}
+/* Wrap the mmapped GGUF in no-copy Metal buffers. A file can be larger than
+   maxBufferLength, so consecutive views overlap by more than the largest tensor:
+   every tensor then lies entirely inside at least one view. */
+static int create_weight_views(dsm_metal *s, char *error, uint32_t error_size) {
+    const dsm_model *m = s->m;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t start = m->gguf.tensor_data_offset & ~(page - 1), end = m->gguf.size;
+    const uint64_t max = max_buffer_bytes(s->device) & ~(page - 1);
+    if (!max) { set_error(error, error_size, "Metal max buffer length is zero"); return 0; }
+    uint64_t max_tensor = 0;
+    for (uint64_t i = 0; i < m->gguf.n_tensors; ++i)
+        if (m->gguf.tensors[i].bytes > max_tensor) max_tensor = m->gguf.tensors[i].bytes;
+    const uint64_t overlap = ((max_tensor + page - 1) & ~(page - 1)) + page;
+    if (overlap >= max) {
+        set_error(error, error_size, "tensor larger than Metal max buffer length");
+        return 0;
+    }
+    const uint64_t step = end - start <= max ? max : max - overlap;
+    s->n_views = end - start <= max ? 1 : (uint32_t)((end - start - overlap + step - 1) / step);
+    s->views = calloc(s->n_views, sizeof(*s->views));
+    if (!s->views) { set_error(error, error_size, "out of memory"); return 0; }
+    for (uint32_t i = 0; i < s->n_views; ++i) {
+        uint64_t off = start + (uint64_t)i * step, bytes = end - off < max ? end - off : max;
+        bytes = (bytes + page - 1) & ~(page - 1);
+        s->views[i].buffer = [s->device newBufferWithBytesNoCopy:(void *)(m->gguf.map + off)
+                                                          length:(NSUInteger)bytes
+                                                         options:MTLResourceStorageModeShared
+                                                     deallocator:nil];
+        s->views[i].file_offset = off;
+        s->views[i].bytes = bytes;
+        if (!s->views[i].buffer) {
+            set_error(error, error_size, "cannot wrap GGUF mmap in Metal buffer");
+            return 0;
+        }
+    }
+    for (uint64_t i = 0; i < m->gguf.n_tensors; ++i) {
+        id<MTLBuffer> buffer;
+        uint64_t offset;
+        if (!tensor_view(s, &m->gguf.tensors[i], &buffer, &offset)) {
+            set_error(error, error_size, "GGUF tensor not mappable to Metal view");
+            return 0;
+        }
+    }
+    if (getenv("DSM_MAX_BUFFER_BYTES"))
+        fprintf(stderr, "dsm: %u Metal weight views of up to %llu bytes\n", s->n_views,
+                (unsigned long long)max);
+    if (@available(macOS 15.0, *)) {
+        MTLResidencySetDescriptor *descriptor = [MTLResidencySetDescriptor new];
+        descriptor.initialCapacity = s->n_views;
+        NSError *ns_error = nil;
+        s->residency = [s->device newResidencySetWithDescriptor:descriptor error:&ns_error];
+        if (s->residency) {
+            for (uint32_t i = 0; i < s->n_views; ++i) [s->residency addAllocation:s->views[i].buffer];
+            [s->residency commit];
+            [s->residency requestResidency];
+            [s->queue addResidencySet:s->residency];
+        }
+    }
+    return 1;
+}
 int dsm_metal_init(dsm_metal **out,const dsm_model *m,uint32_t context,char *error,uint32_t error_size) {
     NSError *ns_error = nil;
     NSString *source = nil;
@@ -682,7 +751,7 @@ int dsm_metal_init(dsm_metal **out,const dsm_model *m,uint32_t context,char *err
     s->mm_f32w_enabled = f32_weight_matmul_enabled();
     const char *fuse_env = getenv("DSM_DECODE_FUSE");
     s->decode_fuse = !fuse_env || strcmp(fuse_env, "0") != 0;
-    const uint64_t page=(uint64_t)getpagesize(), start=m->gguf.tensor_data_offset&~(page-1), end=m->gguf.size, max=[s->device maxBufferLength]&~(page-1);if(!max){set_error(error,error_size,"Metal max buffer length is zero");goto bad;}uint64_t max_tensor=0;for(uint64_t i=0;i<m->gguf.n_tensors;++i)if(m->gguf.tensors[i].bytes>max_tensor)max_tensor=m->gguf.tensors[i].bytes;uint64_t overlap=((max_tensor+page-1)&~(page-1))+page,step=end-start<=max?max:max-overlap;if(overlap>=max){set_error(error,error_size,"tensor larger than Metal max buffer length");goto bad;}s->n_views=end-start<=max?1:(uint32_t)((end-start-overlap+step-1)/step);s->views=calloc(s->n_views,sizeof(*s->views));if(!s->views){set_error(error,error_size,"out of memory");goto bad;}for(uint32_t i=0;i<s->n_views;++i){uint64_t off=start+(uint64_t)i*step,bytes=end-off<max?end-off:max;bytes=(bytes+page-1)&~(page-1);s->views[i].buffer=[s->device newBufferWithBytesNoCopy:(void *)(m->gguf.map+off) length:(NSUInteger)bytes options:MTLResourceStorageModeShared deallocator:nil];s->views[i].file_offset=off;s->views[i].bytes=bytes;if(!s->views[i].buffer){set_error(error,error_size,"cannot wrap GGUF mmap in Metal buffer");goto bad;}}for(uint64_t i=0;i<m->gguf.n_tensors;++i){id<MTLBuffer> wb;uint64_t off;if(!tensor_view(s,&m->gguf.tensors[i],&wb,&off)){set_error(error,error_size,"GGUF tensor not mappable to Metal view");goto bad;}}if(@available(macOS 15.0,*)){MTLResidencySetDescriptor *descriptor=[MTLResidencySetDescriptor new];descriptor.initialCapacity=s->n_views;s->residency=[s->device newResidencySetWithDescriptor:descriptor error:&ns_error];if(s->residency){for(uint32_t i=0;i<s->n_views;++i)[s->residency addAllocation:s->views[i].buffer];[s->residency commit];[s->residency requestResidency];[s->queue addResidencySet:s->residency];}}
+    if (!create_weight_views(s, error, error_size)) goto bad;
     uint32_t ffn=m->is_moe?m->expert_hidden:m->hidden, slots=m->is_moe?m->experts_used:1, context_alloc=(context+63)&~UINT32_C(63);uint64_t kv=(uint64_t)(qwen35_arch(m) ? m->n_attn_layers : m->layers)*context_alloc*m->kv_heads*m->key_dim*4;s->x=buffer(s->device,m->dim*4);s->norm_x=buffer(s->device,m->dim*4);s->q=buffer(s->device,m->q_width*4);s->k=buffer(s->device,(qwen35_arch(m) ? (m->ssm_groups*m->ssm_state > m->kv_heads*m->key_dim ? m->ssm_groups*m->ssm_state : m->kv_heads*m->key_dim) : m->kv_heads*m->key_dim)*4);s->v=buffer(s->device,m->kv_heads*m->value_dim*4);s->att=buffer(s->device,m->attn_width*4);s->tmp=buffer(s->device,m->dim*slots*4);s->gate=buffer(s->device,ffn*slots*4);s->up=buffer(s->device,ffn*slots*4);s->route=m->is_moe?buffer(s->device,m->experts*4):NULL;s->expert_ids=m->is_moe?buffer(s->device,m->experts_used*4):NULL;s->expert_weights=m->is_moe?buffer(s->device,m->experts_used*4):NULL;s->scores=buffer(s->device,(uint64_t)context*m->heads*4);s->keys=buffer(s->device,kv);s->values=buffer(s->device,kv);s->logits=buffer(s->device,m->vocab*4);s->attention_partial=buffer(s->device,(uint64_t)m->heads*((context+63)/64)*(m->key_dim+2)*sizeof(float));s->qg=qwen35_arch(m)?buffer(s->device,(uint64_t)m->q_width*2*4):NULL;s->qkv_mixed=qwen35_arch(m)?buffer(s->device,(m->ssm_inner+2*m->ssm_groups*m->ssm_state)*sizeof(float)):NULL;s->conv_out=qwen35_arch(m)?buffer(s->device,(m->ssm_inner+2*m->ssm_groups*m->ssm_state)*sizeof(float)):NULL;s->z=qwen35_arch(m)?buffer(s->device,m->ssm_inner*4):NULL;s->alpha=qwen35_arch(m)?buffer(s->device,m->ssm_vheads*4):NULL;s->beta=qwen35_arch(m)?buffer(s->device,m->ssm_vheads*4):NULL;s->conv_state=qwen35_arch(m)?buffer(s->device,(uint64_t)m->layers*(m->ssm_inner+2*m->ssm_groups*m->ssm_state)*(m->ssm_conv-1)*4):NULL;s->ssm_state=qwen35_arch(m)?buffer(s->device,(uint64_t)m->layers*m->ssm_vheads*m->ssm_state*m->ssm_state*4):NULL;s->shared_gate=qwen35_arch(m)?buffer(s->device,4):NULL;s->batch_chunk=prefill_chunk_size(m);s->bx=buffer(s->device,(uint64_t)s->batch_chunk*m->dim*4);s->bnorm=buffer(s->device,(uint64_t)s->batch_chunk*m->dim*4);s->bq=buffer(s->device,(uint64_t)s->batch_chunk*m->q_width*4);s->bk=buffer(s->device,(uint64_t)s->batch_chunk*m->kv_heads*m->key_dim*4);s->bv=buffer(s->device,(uint64_t)s->batch_chunk*m->kv_heads*m->value_dim*4);s->batt=buffer(s->device,(uint64_t)s->batch_chunk*m->attn_width*4);s->btmp=buffer(s->device,(uint64_t)s->batch_chunk*m->dim*slots*4);s->bgate=buffer(s->device,(uint64_t)s->batch_chunk*ffn*slots*4);s->bup=buffer(s->device,(uint64_t)s->batch_chunk*ffn*slots*4);s->broute=m->is_moe?buffer(s->device,(uint64_t)s->batch_chunk*m->experts*4):NULL;s->bids=m->is_moe?buffer(s->device,(uint64_t)s->batch_chunk*m->experts_used*4):NULL;s->bw=m->is_moe?buffer(s->device,(uint64_t)s->batch_chunk*m->experts_used*4):NULL;uint32_t max_tiles=m->is_moe?matmul_id_max_tiles(m->experts,m->experts_used,s->batch_chunk):0;s->mm_id_tpe=m->is_moe?buffer(s->device,(uint64_t)(1+3*max_tiles)*sizeof(uint32_t)):NULL;s->mm_id_hids=m->is_moe?buffer(s->device,(uint64_t)(m->experts_used*s->batch_chunk+m->experts)*sizeof(int32_t)):NULL;if(!s->x||!s->norm_x||!s->q||!s->k||!s->v||!s->att||!s->tmp||!s->gate||!s->up||(m->is_moe&&(!s->route||!s->expert_ids||!s->expert_weights))||!s->scores||!s->keys||!s->values||!s->logits||!s->attention_partial||(qwen35_arch(m)&&(!s->qg||!s->qkv_mixed||!s->conv_out||!s->z||!s->alpha||!s->beta||!s->conv_state||!s->ssm_state||!s->shared_gate))||!s->bx||!s->bnorm||!s->bq||!s->bk||!s->bv||!s->batt||!s->btmp||!s->bgate||!s->bup||(m->is_moe&&(!s->broute||!s->bids||!s->bw||!s->mm_id_tpe||!s->mm_id_hids))){set_error(error,error_size,"cannot allocate Metal activations");goto bad;}
     if (qwen35_arch(m)) {
         uint32_t qk = m->ssm_groups * m->ssm_state;
