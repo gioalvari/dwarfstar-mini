@@ -112,11 +112,32 @@ static NSString *shader_path(void) {
 }
 static id<MTLComputePipelineState> pipeline(id<MTLDevice> dev, id<MTLLibrary> lib, NSString *name, char *error, uint32_t cap) {
     NSError *ns_error = nil; id<MTLFunction> fn = [lib newFunctionWithName:name];
-    if (!fn) { set_error(error, cap, "required Metal kernel is missing"); return nil; }
+    if (!fn) {
+        set_error(error, cap, [[NSString stringWithFormat:@"required Metal kernel is missing: %@",
+                                                         name] UTF8String]);
+        return nil;
+    }
     id<MTLComputePipelineState> state = [dev newComputePipelineStateWithFunction:fn error:&ns_error];
     if (!state) set_error(error, cap, ns_error.localizedDescription.UTF8String);
     return state;
 }
+typedef struct {
+    size_t offset;
+    NSString *name;
+} pipeline_spec;
+
+static int create_pipelines(dsm_metal *state, id<MTLLibrary> library,
+                            const pipeline_spec *specs, size_t count,
+                            char *error, uint32_t error_size) {
+    for (size_t i = 0; i < count; ++i) {
+        id<MTLComputePipelineState> *field =
+                (id<MTLComputePipelineState> *)((char *)state + specs[i].offset);
+        *field = pipeline(state->device, library, specs[i].name, error, error_size);
+        if (!*field) return 0;
+    }
+    return 1;
+}
+
 static id<MTLBuffer> buffer(id<MTLDevice> device, uint64_t bytes) {
     return [device newBufferWithLength:(NSUInteger)bytes options:MTLResourceStorageModeShared];
 }
@@ -574,16 +595,93 @@ int dsm_metal_init(dsm_metal **out,const dsm_model *m,uint32_t context,char *err
     if (m->is_moe && (m->experts > 256 || (m->experts + 31) / 32 > 8)) {
         set_error(error, error_size, "Metal route_topk supports at most 256 experts"); goto bad;
     }
-    s->q8=pipeline(s->device,lib,@"q8_gemv",error,error_size);s->q2k=pipeline(s->device,lib,@"q2k_gemv",error,error_size);s->q3k=pipeline(s->device,lib,@"q3k_gemv",error,error_size);s->q4k=pipeline(s->device,lib,@"q4k_gemv",error,error_size);s->q5k=pipeline(s->device,lib,@"q5k_gemv",error,error_size);s->q6k=pipeline(s->device,lib,@"q6k_gemv",error,error_size);s->f32=pipeline(s->device,lib,@"f32_gemv",error,error_size);s->norm=pipeline(s->device,lib,@"rmsnorm",error,error_size);s->rope=pipeline(s->device,lib,@"rope_neox",error,error_size);s->rope_partial=pipeline(s->device,lib,@"rope_neox_partial",error,error_size);s->split_q_gate=pipeline(s->device,lib,@"split_q_gate",error,error_size);s->split_gdn_qk=pipeline(s->device,lib,@"split_gdn_qk",error,error_size);s->l2norm=pipeline(s->device,lib,@"l2norm_heads",error,error_size);s->ssm_conv=pipeline(s->device,lib,@"ssm_conv_step",error,error_size);s->gdn_gates=pipeline(s->device,lib,@"gdn_gates",error,error_size);s->gdn=pipeline(s->device,lib,@"gated_delta_net",error,error_size);s->gated_rmsnorm=pipeline(s->device,lib,@"gated_rmsnorm_silu",error,error_size);s->sigmoid_mul=pipeline(s->device,lib,@"sigmoid_mul",error,error_size);s->shexp_add=pipeline(s->device,lib,@"shexp_add",error,error_size);s->ssm_conv_batch=pipeline(s->device,lib,@"ssm_conv_batch",error,error_size);s->split_gdn_qk_batch=pipeline(s->device,lib,@"split_gdn_qk_batch",error,error_size);s->gdn_gates_batch=pipeline(s->device,lib,@"gdn_gates_batch",error,error_size);s->gdn_batch=pipeline(s->device,lib,@"gated_delta_net_batch",error,error_size);s->cache=pipeline(s->device,lib,@"cache_write",error,error_size);s->attention=pipeline(s->device,lib,@"attention_decode",error,error_size);s->attention_split=pipeline(s->device,lib,@"attention_decode_split",error,error_size);s->attention_merge=pipeline(s->device,lib,@"attention_decode_merge",error,error_size);s->add=pipeline(s->device,lib,@"add_inplace",error,error_size);s->add_rmsnorm=pipeline(s->device,lib,@"add_rmsnorm",error,error_size);s->qk_norm_rope=pipeline(s->device,lib,@"qk_norm_rope",error,error_size);s->swiglu=pipeline(s->device,lib,@"swiglu",error,error_size);s->route_topk=pipeline(s->device,lib,@"route_topk",error,error_size);s->expert_q8=pipeline(s->device,lib,@"expert_q8_0_gemv",error,error_size);s->expert_q8_fast=pipeline(s->device,lib,@"expert_q8_0_gemv_fast",error,error_size);s->expert_q3k=pipeline(s->device,lib,@"expert_q3k_gemv",error,error_size);s->expert_q4k=pipeline(s->device,lib,@"expert_q4k_gemv",error,error_size);s->expert_q5k=pipeline(s->device,lib,@"expert_q5k_gemv",error,error_size);s->expert_q6k=pipeline(s->device,lib,@"expert_q6k_gemv",error,error_size);s->expert_swiglu=pipeline(s->device,lib,@"expert_swiglu",error,error_size);s->moe_add=pipeline(s->device,lib,@"moe_add",error,error_size);if(!s->q8||!s->q2k||!s->q3k||!s->q4k||!s->q5k||!s->q6k||!s->f32||!s->norm||!s->rope||!s->rope_partial||!s->split_q_gate||!s->split_gdn_qk||!s->l2norm||!s->ssm_conv||!s->gdn_gates||!s->gdn||!s->gated_rmsnorm||!s->sigmoid_mul||!s->shexp_add||!s->ssm_conv_batch||!s->split_gdn_qk_batch||!s->gdn_gates_batch||!s->gdn_batch||!s->cache||!s->attention||!s->attention_split||!s->attention_merge||!s->add||!s->swiglu||!s->route_topk||!s->expert_q8||!s->expert_q8_fast||!s->expert_q3k||!s->expert_q4k||!s->expert_q5k||!s->expert_q6k||!s->expert_swiglu||!s->moe_add)goto bad;
-    s->rope_batch=pipeline(s->device,lib,@"rope_neox_batch",error,error_size);s->rope_partial_batch=pipeline(s->device,lib,@"rope_neox_partial_batch",error,error_size);s->cache_batch=pipeline(s->device,lib,@"cache_write_batch",error,error_size);s->attention_prefill=pipeline(s->device,lib,@"attention_prefill",error,error_size);s->attention_prefill_d256=pipeline(s->device,lib,@"attention_prefill_d256",error,error_size);s->attention_prefill_d128_tiled=pipeline(s->device,lib,@"attention_prefill_d128_tiled",error,error_size);s->attention_prefill_fa128=pipeline(s->device,lib,@"attention_prefill_fa128",error,error_size);s->moe_add_batch=pipeline(s->device,lib,@"moe_add_batch",error,error_size);s->mm_q8=pipeline(s->device,lib,@"mul_mm_q8_0",error,error_size);s->mm_q2k=pipeline(s->device,lib,@"mul_mm_q2_K",error,error_size);s->mm_q3k=pipeline(s->device,lib,@"mul_mm_q3_K",error,error_size);s->mm_q4k=pipeline(s->device,lib,@"mul_mm_q4_K",error,error_size);s->mm_q5k=pipeline(s->device,lib,@"mul_mm_q5_K",error,error_size);s->mm_q6k=pipeline(s->device,lib,@"mul_mm_q6_K",error,error_size);s->mm_id_map0=pipeline(s->device,lib,@"mul_mm_id_map0",error,error_size);s->mm_id_q8=pipeline(s->device,lib,@"mul_mm_id_q8_0",error,error_size);s->mm_id_q2k=pipeline(s->device,lib,@"mul_mm_id_q2_K",error,error_size);s->mm_id_q3k=pipeline(s->device,lib,@"mul_mm_id_q3_K",error,error_size);s->mm_id_q4k=pipeline(s->device,lib,@"mul_mm_id_q4_K",error,error_size);s->mm_id_q5k=pipeline(s->device,lib,@"mul_mm_id_q5_K",error,error_size);s->mm_id_q6k=pipeline(s->device,lib,@"mul_mm_id_q6_K",error,error_size);{static NSString *const mmf_names[6]={@"q8_0",@"q2_K",@"q3_K",@"q4_K",@"q5_K",@"q6_K"};for(int i=0;i<6;++i){s->mmf[i]=pipeline(s->device,lib,[NSString stringWithFormat:@"mul_mm_%@_f32",mmf_names[i]],error,error_size);s->mmf_id[i]=pipeline(s->device,lib,[NSString stringWithFormat:@"mul_mm_id_%@_f32",mmf_names[i]],error,error_size);if(!s->mmf[i]||!s->mmf_id[i])goto bad;}const char *mmf_env=getenv("DSM_MM_F32");s->mm_f32=mmf_env?strcmp(mmf_env,"0")!=0:qwen35_arch(m);}if(!s->rope_batch||!s->rope_partial_batch||!s->cache_batch||!s->attention_prefill||!s->attention_prefill_d256||!s->attention_prefill_d128_tiled||!s->attention_prefill_fa128||!s->moe_add_batch||!s->mm_q8||!s->mm_q2k||!s->mm_q3k||!s->mm_q4k||!s->mm_q5k||!s->mm_q6k||!s->mm_id_map0||!s->mm_id_q8||!s->mm_id_q2k||!s->mm_id_q3k||!s->mm_id_q4k||!s->mm_id_q5k||!s->mm_id_q6k)goto bad;
-    s->f32_rows = pipeline(s->device, lib, @"f32_gemv_rows", error, error_size);
-    s->mm_f32w = pipeline(s->device, lib, @"mul_mm_f32w_f32", error, error_size);
-    s->shexp_add_batch = pipeline(s->device, lib, @"shexp_add_batch", error,
-                                  error_size);
+    static const pipeline_spec specs[] = {
+        {offsetof(struct dsm_metal, q8), @"q8_gemv"},
+        {offsetof(struct dsm_metal, q2k), @"q2k_gemv"},
+        {offsetof(struct dsm_metal, q3k), @"q3k_gemv"},
+        {offsetof(struct dsm_metal, q4k), @"q4k_gemv"},
+        {offsetof(struct dsm_metal, q5k), @"q5k_gemv"},
+        {offsetof(struct dsm_metal, q6k), @"q6k_gemv"},
+        {offsetof(struct dsm_metal, f32), @"f32_gemv"},
+        {offsetof(struct dsm_metal, norm), @"rmsnorm"},
+        {offsetof(struct dsm_metal, rope), @"rope_neox"},
+        {offsetof(struct dsm_metal, rope_partial), @"rope_neox_partial"},
+        {offsetof(struct dsm_metal, split_q_gate), @"split_q_gate"},
+        {offsetof(struct dsm_metal, split_gdn_qk), @"split_gdn_qk"},
+        {offsetof(struct dsm_metal, l2norm), @"l2norm_heads"},
+        {offsetof(struct dsm_metal, ssm_conv), @"ssm_conv_step"},
+        {offsetof(struct dsm_metal, gdn_gates), @"gdn_gates"},
+        {offsetof(struct dsm_metal, gdn), @"gated_delta_net"},
+        {offsetof(struct dsm_metal, gated_rmsnorm), @"gated_rmsnorm_silu"},
+        {offsetof(struct dsm_metal, sigmoid_mul), @"sigmoid_mul"},
+        {offsetof(struct dsm_metal, shexp_add), @"shexp_add"},
+        {offsetof(struct dsm_metal, ssm_conv_batch), @"ssm_conv_batch"},
+        {offsetof(struct dsm_metal, split_gdn_qk_batch), @"split_gdn_qk_batch"},
+        {offsetof(struct dsm_metal, gdn_gates_batch), @"gdn_gates_batch"},
+        {offsetof(struct dsm_metal, gdn_batch), @"gated_delta_net_batch"},
+        {offsetof(struct dsm_metal, cache), @"cache_write"},
+        {offsetof(struct dsm_metal, attention), @"attention_decode"},
+        {offsetof(struct dsm_metal, attention_split), @"attention_decode_split"},
+        {offsetof(struct dsm_metal, attention_merge), @"attention_decode_merge"},
+        {offsetof(struct dsm_metal, add), @"add_inplace"},
+        {offsetof(struct dsm_metal, add_rmsnorm), @"add_rmsnorm"},
+        {offsetof(struct dsm_metal, qk_norm_rope), @"qk_norm_rope"},
+        {offsetof(struct dsm_metal, swiglu), @"swiglu"},
+        {offsetof(struct dsm_metal, route_topk), @"route_topk"},
+        {offsetof(struct dsm_metal, expert_q8), @"expert_q8_0_gemv"},
+        {offsetof(struct dsm_metal, expert_q8_fast), @"expert_q8_0_gemv_fast"},
+        {offsetof(struct dsm_metal, expert_q3k), @"expert_q3k_gemv"},
+        {offsetof(struct dsm_metal, expert_q4k), @"expert_q4k_gemv"},
+        {offsetof(struct dsm_metal, expert_q5k), @"expert_q5k_gemv"},
+        {offsetof(struct dsm_metal, expert_q6k), @"expert_q6k_gemv"},
+        {offsetof(struct dsm_metal, expert_swiglu), @"expert_swiglu"},
+        {offsetof(struct dsm_metal, moe_add), @"moe_add"},
+        {offsetof(struct dsm_metal, rope_batch), @"rope_neox_batch"},
+        {offsetof(struct dsm_metal, rope_partial_batch), @"rope_neox_partial_batch"},
+        {offsetof(struct dsm_metal, cache_batch), @"cache_write_batch"},
+        {offsetof(struct dsm_metal, attention_prefill), @"attention_prefill"},
+        {offsetof(struct dsm_metal, attention_prefill_d256), @"attention_prefill_d256"},
+        {offsetof(struct dsm_metal, attention_prefill_d128_tiled), @"attention_prefill_d128_tiled"},
+        {offsetof(struct dsm_metal, attention_prefill_fa128), @"attention_prefill_fa128"},
+        {offsetof(struct dsm_metal, moe_add_batch), @"moe_add_batch"},
+        {offsetof(struct dsm_metal, mm_q8), @"mul_mm_q8_0"},
+        {offsetof(struct dsm_metal, mm_q2k), @"mul_mm_q2_K"},
+        {offsetof(struct dsm_metal, mm_q3k), @"mul_mm_q3_K"},
+        {offsetof(struct dsm_metal, mm_q4k), @"mul_mm_q4_K"},
+        {offsetof(struct dsm_metal, mm_q5k), @"mul_mm_q5_K"},
+        {offsetof(struct dsm_metal, mm_q6k), @"mul_mm_q6_K"},
+        {offsetof(struct dsm_metal, mm_id_map0), @"mul_mm_id_map0"},
+        {offsetof(struct dsm_metal, mm_id_q8), @"mul_mm_id_q8_0"},
+        {offsetof(struct dsm_metal, mm_id_q2k), @"mul_mm_id_q2_K"},
+        {offsetof(struct dsm_metal, mm_id_q3k), @"mul_mm_id_q3_K"},
+        {offsetof(struct dsm_metal, mm_id_q4k), @"mul_mm_id_q4_K"},
+        {offsetof(struct dsm_metal, mm_id_q5k), @"mul_mm_id_q5_K"},
+        {offsetof(struct dsm_metal, mm_id_q6k), @"mul_mm_id_q6_K"},
+        {offsetof(struct dsm_metal, f32_rows), @"f32_gemv_rows"},
+        {offsetof(struct dsm_metal, mm_f32w), @"mul_mm_f32w_f32"},
+        {offsetof(struct dsm_metal, shexp_add_batch), @"shexp_add_batch"},
+        {offsetof(struct dsm_metal, mmf[0]), @"mul_mm_q8_0_f32"},
+        {offsetof(struct dsm_metal, mmf[1]), @"mul_mm_q2_K_f32"},
+        {offsetof(struct dsm_metal, mmf[2]), @"mul_mm_q3_K_f32"},
+        {offsetof(struct dsm_metal, mmf[3]), @"mul_mm_q4_K_f32"},
+        {offsetof(struct dsm_metal, mmf[4]), @"mul_mm_q5_K_f32"},
+        {offsetof(struct dsm_metal, mmf[5]), @"mul_mm_q6_K_f32"},
+        {offsetof(struct dsm_metal, mmf_id[0]), @"mul_mm_id_q8_0_f32"},
+        {offsetof(struct dsm_metal, mmf_id[1]), @"mul_mm_id_q2_K_f32"},
+        {offsetof(struct dsm_metal, mmf_id[2]), @"mul_mm_id_q3_K_f32"},
+        {offsetof(struct dsm_metal, mmf_id[3]), @"mul_mm_id_q4_K_f32"},
+        {offsetof(struct dsm_metal, mmf_id[4]), @"mul_mm_id_q5_K_f32"},
+        {offsetof(struct dsm_metal, mmf_id[5]), @"mul_mm_id_q6_K_f32"},
+    };
+    if (!create_pipelines(s, lib, specs, sizeof(specs) / sizeof(*specs),
+                          error, error_size)) {
+        goto bad;
+    }
+    const char *mmf_env = getenv("DSM_MM_F32");
+    s->mm_f32 = mmf_env ? strcmp(mmf_env, "0") != 0 : qwen35_arch(m);
     s->mm_f32w_enabled = f32_weight_matmul_enabled();
     const char *fuse_env = getenv("DSM_DECODE_FUSE");
     s->decode_fuse = !fuse_env || strcmp(fuse_env, "0") != 0;
-    if (!s->f32_rows || !s->mm_f32w || !s->shexp_add_batch || !s->add_rmsnorm || !s->qk_norm_rope) goto bad;
     const uint64_t page=(uint64_t)getpagesize(), start=m->gguf.tensor_data_offset&~(page-1), end=m->gguf.size, max=[s->device maxBufferLength]&~(page-1);if(!max){set_error(error,error_size,"Metal max buffer length is zero");goto bad;}uint64_t max_tensor=0;for(uint64_t i=0;i<m->gguf.n_tensors;++i)if(m->gguf.tensors[i].bytes>max_tensor)max_tensor=m->gguf.tensors[i].bytes;uint64_t overlap=((max_tensor+page-1)&~(page-1))+page,step=end-start<=max?max:max-overlap;if(overlap>=max){set_error(error,error_size,"tensor larger than Metal max buffer length");goto bad;}s->n_views=end-start<=max?1:(uint32_t)((end-start-overlap+step-1)/step);s->views=calloc(s->n_views,sizeof(*s->views));if(!s->views){set_error(error,error_size,"out of memory");goto bad;}for(uint32_t i=0;i<s->n_views;++i){uint64_t off=start+(uint64_t)i*step,bytes=end-off<max?end-off:max;bytes=(bytes+page-1)&~(page-1);s->views[i].buffer=[s->device newBufferWithBytesNoCopy:(void *)(m->gguf.map+off) length:(NSUInteger)bytes options:MTLResourceStorageModeShared deallocator:nil];s->views[i].file_offset=off;s->views[i].bytes=bytes;if(!s->views[i].buffer){set_error(error,error_size,"cannot wrap GGUF mmap in Metal buffer");goto bad;}}for(uint64_t i=0;i<m->gguf.n_tensors;++i){id<MTLBuffer> wb;uint64_t off;if(!tensor_view(s,&m->gguf.tensors[i],&wb,&off)){set_error(error,error_size,"GGUF tensor not mappable to Metal view");goto bad;}}if(@available(macOS 15.0,*)){MTLResidencySetDescriptor *descriptor=[MTLResidencySetDescriptor new];descriptor.initialCapacity=s->n_views;s->residency=[s->device newResidencySetWithDescriptor:descriptor error:&ns_error];if(s->residency){for(uint32_t i=0;i<s->n_views;++i)[s->residency addAllocation:s->views[i].buffer];[s->residency commit];[s->residency requestResidency];[s->queue addResidencySet:s->residency];}}
     uint32_t ffn=m->is_moe?m->expert_hidden:m->hidden, slots=m->is_moe?m->experts_used:1, context_alloc=(context+63)&~UINT32_C(63);uint64_t kv=(uint64_t)(qwen35_arch(m) ? m->n_attn_layers : m->layers)*context_alloc*m->kv_heads*m->key_dim*4;s->x=buffer(s->device,m->dim*4);s->norm_x=buffer(s->device,m->dim*4);s->q=buffer(s->device,m->q_width*4);s->k=buffer(s->device,(qwen35_arch(m) ? (m->ssm_groups*m->ssm_state > m->kv_heads*m->key_dim ? m->ssm_groups*m->ssm_state : m->kv_heads*m->key_dim) : m->kv_heads*m->key_dim)*4);s->v=buffer(s->device,m->kv_heads*m->value_dim*4);s->att=buffer(s->device,m->attn_width*4);s->tmp=buffer(s->device,m->dim*slots*4);s->gate=buffer(s->device,ffn*slots*4);s->up=buffer(s->device,ffn*slots*4);s->route=m->is_moe?buffer(s->device,m->experts*4):NULL;s->expert_ids=m->is_moe?buffer(s->device,m->experts_used*4):NULL;s->expert_weights=m->is_moe?buffer(s->device,m->experts_used*4):NULL;s->scores=buffer(s->device,(uint64_t)context*m->heads*4);s->keys=buffer(s->device,kv);s->values=buffer(s->device,kv);s->logits=buffer(s->device,m->vocab*4);s->attention_partial=buffer(s->device,(uint64_t)m->heads*((context+63)/64)*(m->key_dim+2)*sizeof(float));s->qg=qwen35_arch(m)?buffer(s->device,(uint64_t)m->q_width*2*4):NULL;s->qkv_mixed=qwen35_arch(m)?buffer(s->device,(m->ssm_inner+2*m->ssm_groups*m->ssm_state)*sizeof(float)):NULL;s->conv_out=qwen35_arch(m)?buffer(s->device,(m->ssm_inner+2*m->ssm_groups*m->ssm_state)*sizeof(float)):NULL;s->z=qwen35_arch(m)?buffer(s->device,m->ssm_inner*4):NULL;s->alpha=qwen35_arch(m)?buffer(s->device,m->ssm_vheads*4):NULL;s->beta=qwen35_arch(m)?buffer(s->device,m->ssm_vheads*4):NULL;s->conv_state=qwen35_arch(m)?buffer(s->device,(uint64_t)m->layers*(m->ssm_inner+2*m->ssm_groups*m->ssm_state)*(m->ssm_conv-1)*4):NULL;s->ssm_state=qwen35_arch(m)?buffer(s->device,(uint64_t)m->layers*m->ssm_vheads*m->ssm_state*m->ssm_state*4):NULL;s->shared_gate=qwen35_arch(m)?buffer(s->device,4):NULL;s->batch_chunk=prefill_chunk_size(m);s->bx=buffer(s->device,(uint64_t)s->batch_chunk*m->dim*4);s->bnorm=buffer(s->device,(uint64_t)s->batch_chunk*m->dim*4);s->bq=buffer(s->device,(uint64_t)s->batch_chunk*m->q_width*4);s->bk=buffer(s->device,(uint64_t)s->batch_chunk*m->kv_heads*m->key_dim*4);s->bv=buffer(s->device,(uint64_t)s->batch_chunk*m->kv_heads*m->value_dim*4);s->batt=buffer(s->device,(uint64_t)s->batch_chunk*m->attn_width*4);s->btmp=buffer(s->device,(uint64_t)s->batch_chunk*m->dim*slots*4);s->bgate=buffer(s->device,(uint64_t)s->batch_chunk*ffn*slots*4);s->bup=buffer(s->device,(uint64_t)s->batch_chunk*ffn*slots*4);s->broute=m->is_moe?buffer(s->device,(uint64_t)s->batch_chunk*m->experts*4):NULL;s->bids=m->is_moe?buffer(s->device,(uint64_t)s->batch_chunk*m->experts_used*4):NULL;s->bw=m->is_moe?buffer(s->device,(uint64_t)s->batch_chunk*m->experts_used*4):NULL;uint32_t max_tiles=m->is_moe?matmul_id_max_tiles(m->experts,m->experts_used,s->batch_chunk):0;s->mm_id_tpe=m->is_moe?buffer(s->device,(uint64_t)(1+3*max_tiles)*sizeof(uint32_t)):NULL;s->mm_id_hids=m->is_moe?buffer(s->device,(uint64_t)(m->experts_used*s->batch_chunk+m->experts)*sizeof(int32_t)):NULL;if(!s->x||!s->norm_x||!s->q||!s->k||!s->v||!s->att||!s->tmp||!s->gate||!s->up||(m->is_moe&&(!s->route||!s->expert_ids||!s->expert_weights))||!s->scores||!s->keys||!s->values||!s->logits||!s->attention_partial||(qwen35_arch(m)&&(!s->qg||!s->qkv_mixed||!s->conv_out||!s->z||!s->alpha||!s->beta||!s->conv_state||!s->ssm_state||!s->shared_gate))||!s->bx||!s->bnorm||!s->bq||!s->bk||!s->bv||!s->batt||!s->btmp||!s->bgate||!s->bup||(m->is_moe&&(!s->broute||!s->bids||!s->bw||!s->mm_id_tpe||!s->mm_id_hids))){set_error(error,error_size,"cannot allocate Metal activations");goto bad;}
     if (qwen35_arch(m)) {
