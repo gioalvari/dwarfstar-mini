@@ -124,8 +124,8 @@ published benchmark scores of each model.
 `make test` runs the unit tests. With models in `models/`, these targets check
 the GPU paths: `check-prefill` (batched prefill against the token-by-token
 path), `check-ref` (logits against llama.cpp), `check-rewind`,
-`check-metal-gemv`, `check-attn`, and the benchmarks `bench-prefill` and
-`bench-gemv`.
+`check-metal-gemv`, `check-attn`, `check-views` (weights split across several
+Metal buffers), and the benchmarks `bench-prefill` and `bench-gemv`.
 
 ## License and acknowledgements
 
