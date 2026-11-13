@@ -33,8 +33,10 @@ The server handles one request at a time and exposes `GET /v1/models` and
 `max_completion_tokens`), `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
 `presence_penalty`, `frequency_penalty`, `stop`, `stream`, `tools`,
 `chat_template_kwargs.enable_thinking`, and `reasoning_effort`. Responses
-include OpenAI-style token `usage`; thinking models return hidden chain of
-thought separately as `reasoning_content`.
+include OpenAI-style token `usage`. When thinking is on, the text between
+`<think>` and `</think>` is returned in `reasoning_content` (`delta.reasoning_content`
+when streaming) instead of `content`. `enable_thinking: false` or
+`reasoning_effort: "none"` turns thinking off.
 
 ## Environment variables
 
