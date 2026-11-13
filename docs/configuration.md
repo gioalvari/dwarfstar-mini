@@ -4,6 +4,7 @@
 
 ```
 dsm -m MODEL -p PROMPT [-n N] [--backend metal|cpu] [--threads N] [--temp T]
+    [--top-k K] [--top-p P] [--min-p P] [--seed N]
     [--chat] [--dump-logits FILE] [--tokens-only]
 dsm -m MODEL --render-chat REQUEST.json
 dsm serve -m MODEL [--backend metal|cpu] [--host 127.0.0.1] [--port 8080]
@@ -16,6 +17,10 @@ dsm serve -m MODEL [--backend metal|cpu] [--host 127.0.0.1] [--port 8080]
 | `--backend` | `metal` when available | `cpu` runs the scalar reference path |
 | `--threads N` | 8 | CPU threads (CPU backend only) |
 | `--temp T` | 0 | sampling temperature; 0 is greedy |
+| `--top-k K` | 0 | keep the K most likely tokens; 0 disables the cutoff |
+| `--top-p P` | 0.95 | nucleus-sampling probability cutoff |
+| `--min-p P` | 0 | discard tokens below P times the most likely token |
+| `--seed N` | 1 | deterministic random seed for sampled CLI output |
 | `--chat` | off | wrap the prompt in the model's chat template |
 | `--dump-logits FILE` | off | write the logits of every position |
 | `--tokens-only` | off | print the token ids of the prompt and exit |
@@ -25,8 +30,11 @@ dsm serve -m MODEL [--backend metal|cpu] [--host 127.0.0.1] [--port 8080]
 
 The server handles one request at a time and exposes `GET /v1/models` and
 `POST /v1/chat/completions`. Request fields read: `messages`, `max_tokens` (or
-`max_completion_tokens`), `temperature`, `top_p`, `stop`, `stream` and
-`tools`.
+`max_completion_tokens`), `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
+`presence_penalty`, `frequency_penalty`, `stop`, `stream`, `tools`,
+`chat_template_kwargs.enable_thinking`, and `reasoning_effort`. Responses
+include OpenAI-style token `usage`; thinking models return hidden chain of
+thought separately as `reasoning_content`.
 
 ## Environment variables
 

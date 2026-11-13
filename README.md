@@ -109,7 +109,8 @@ published benchmark scores of each model.
 - No vision input and no multi-token prediction.
 - The server runs one request at a time and only implements
   `GET /v1/models` and `POST /v1/chat/completions` (with streaming and tool
-  calls). Sampling supports `temperature` and `top_p` only.
+  calls). Sampling supports temperature, top-p/top-k/min-p, deterministic
+  seeds, and OpenAI presence/frequency penalties.
 
 ## Docs
 

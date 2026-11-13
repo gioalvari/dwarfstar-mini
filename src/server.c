@@ -43,6 +43,8 @@ typedef struct {
   size_t len, cap;
 } string;
 
+static int append_assistant_content(const dsm_json *value, string *out);
+
 static double now(void) {
   struct timespec t;
   clock_gettime(CLOCK_MONOTONIC, &t);
@@ -354,6 +356,13 @@ static int append_tool_calls(string *prompt, const dsm_json *calls) {
   }
   return 1;
 }
+static int thinking_disabled(const dsm_json *root) {
+  const dsm_json *kwargs = dsm_json_object_get(root, "chat_template_kwargs");
+  const dsm_json *thinking =
+      kwargs ? dsm_json_object_get(kwargs, "enable_thinking") : NULL;
+  return (thinking && thinking->type == DSM_JSON_BOOL && !thinking->boolean) ||
+         json_is(dsm_json_object_get(root, "reasoning_effort"), "none");
+}
 static int make_prompt(const dsm_json *root, string *prompt) {
   const dsm_json *messages = dsm_json_object_get(root, "messages"),
                  *tools = dsm_json_object_get(root, "tools");
@@ -385,9 +394,9 @@ static int make_prompt(const dsm_json *root, string *prompt) {
       return 0;
     if (json_is(role, "assistant") && calls && calls->type == DSM_JSON_ARRAY) {
       if (!append(prompt, LIT("<|im_start|>assistant")) ||
-          (content &&
-           (!append(prompt, LIT("\n")) || !parse_content(content, prompt) ||
-            !append(prompt, LIT("\n")))) ||
+          (content && (!append(prompt, LIT("\n")) ||
+                       !append_assistant_content(content, prompt) ||
+                       !append(prompt, LIT("\n")))) ||
           !append_tool_calls(prompt, calls) ||
           !append(prompt, LIT("<|im_end|>\n")))
         return 0;
@@ -413,10 +422,16 @@ static int make_prompt(const dsm_json *root, string *prompt) {
          !json_is(role, "assistant")) ||
         !append(prompt, LIT("<|im_start|>")) ||
         !append(prompt, role->text, role->len) || !append(prompt, LIT("\n")) ||
-        !parse_content(content, prompt) || !append(prompt, LIT("<|im_end|>\n")))
+        !(json_is(role, "assistant") ? append_assistant_content(content, prompt)
+                                     : parse_content(content, prompt)) ||
+        !append(prompt, LIT("<|im_end|>\n")))
       return 0;
   }
-  return append(prompt, LIT("<|im_start|>assistant\n"));
+  if (!append(prompt, LIT("<|im_start|>assistant\n")))
+    return 0;
+  if (thinking_disabled(root))
+    return append(prompt, LIT("<think>\n\n</think>\n\n"));
+  return append(prompt, LIT("<think>\n"));
 }
 int dsm_server_make_prompt(const dsm_json *root, char **out) {
   string prompt = {0};
@@ -555,6 +570,55 @@ bad:
   *count = 0;
   return 0;
 }
+static int split_reasoning(const char *output, char **reasoning,
+                           char **content) {
+  const char *start = strstr(output, "<think>");
+  const char *end = strstr(output, "</think>");
+  string visible = {0};
+  *reasoning = NULL;
+  if (!start) {
+    if (end) {
+      *reasoning = trim_copy(output, (size_t)(end - output));
+      *content = trim_copy(end + strlen("</think>"),
+                           strlen(end + strlen("</think>")));
+      return *reasoning && *content;
+    }
+    *content = strdup(output);
+    return *content != NULL;
+  }
+  end = strstr(start + strlen("<think>"), "</think>");
+  if (!end) {
+    *reasoning =
+        trim_copy(start + strlen("<think>"), strlen(start + strlen("<think>")));
+    *content = trim_copy(output, (size_t)(start - output));
+    return *reasoning && *content;
+  }
+  *reasoning = trim_copy(start + strlen("<think>"),
+                         (size_t)(end - (start + strlen("<think>"))));
+  if (!append(&visible, output, (size_t)(start - output)) ||
+      !append(&visible, end + strlen("</think>"),
+              strlen(end + strlen("</think>")))) {
+    free(visible.data);
+    free(*reasoning);
+    *reasoning = NULL;
+    return 0;
+  }
+  *content = trim_copy(visible.data, visible.len);
+  free(visible.data);
+  return *reasoning && *content;
+}
+static int append_assistant_content(const dsm_json *value, string *out) {
+  string raw = {0};
+  char *reasoning = NULL;
+  char *content = NULL;
+  int ok = parse_content(value, &raw) &&
+           split_reasoning(raw.data, &reasoning, &content) &&
+           append(out, content, strlen(content));
+  free(raw.data);
+  free(reasoning);
+  free(content);
+  return ok;
+}
 static size_t common_prefix(const int32_t *a, size_t an, const int32_t *b,
                             size_t bn) {
   size_t n = an < bn ? an : bn, i = 0;
@@ -591,7 +655,7 @@ static int cache_tokens(server *s, const dsm_tokens *tokens,
   return 1;
 }
 static int sse_chunk(int fd, const char *id, const char *content,
-                     const char *finish) {
+                     const char *reasoning, const char *finish) {
   string out = {0};
   if (!append(&out, LIT("data: {\"id\":\"")) || !append(&out, id, strlen(id)) ||
       !append(&out, LIT("\",\"object\":\"chat.completion.chunk\",\"choices\":[{"
@@ -599,6 +663,13 @@ static int sse_chunk(int fd, const char *id, const char *content,
     goto bad;
   if (content) {
     if (!append(&out, LIT("\"content\":")) || !json_string(&out, content))
+      goto bad;
+  }
+  if (reasoning) {
+    if (content && !append(&out, LIT(",")))
+      goto bad;
+    if (!append(&out, LIT("\"reasoning_content\":")) ||
+        !json_string(&out, reasoning))
       goto bad;
   }
   if (!append(&out, LIT("},\"finish_reason\":")))
@@ -652,9 +723,12 @@ static int generate(server *s, int fd, const dsm_json *root) {
   char **stops = NULL;
   size_t stop_count = 0;
   char *content = NULL;
+  char *reasoning = NULL;
   dsm_tool_call *calls = NULL;
   size_t call_count = 0;
   int tools_requested = 0;
+  int streamed_reasoning = 0;
+  int thinking = !thinking_disabled(root);
   dsm_sampler sampler = {0};
   const dsm_json *v = dsm_json_object_get(root, "max_completion_tokens");
   if (!v)
@@ -674,17 +748,16 @@ static int generate(server *s, int fd, const dsm_json *root) {
   float top_p = top_p_v && top_p_v->type == DSM_JSON_NUMBER
                     ? (float)top_p_v->number
                     : 1.0f;
-  uint32_t top_k = top_k_v && top_k_v->type == DSM_JSON_NUMBER &&
-                           top_k_v->number > 0
-                       ? (uint32_t)top_k_v->number
-                       : 0;
-  float min_p = min_p_v && min_p_v->type == DSM_JSON_NUMBER
-                    ? (float)min_p_v->number
-                    : 0;
-  uint64_t seed = seed_v && seed_v->type == DSM_JSON_NUMBER &&
-                          seed_v->number > 0
-                      ? (uint64_t)seed_v->number
-                      : 1;
+  uint32_t top_k =
+      top_k_v && top_k_v->type == DSM_JSON_NUMBER && top_k_v->number > 0
+          ? (uint32_t)top_k_v->number
+          : 0;
+  float min_p =
+      min_p_v && min_p_v->type == DSM_JSON_NUMBER ? (float)min_p_v->number : 0;
+  uint64_t seed =
+      seed_v && seed_v->type == DSM_JSON_NUMBER && seed_v->number > 0
+          ? (uint64_t)seed_v->number
+          : 1;
   float presence_penalty = presence_v && presence_v->type == DSM_JSON_NUMBER
                                ? (float)presence_v->number
                                : 0;
@@ -802,8 +875,8 @@ static int generate(server *s, int fd, const dsm_json *root) {
                           "no-cache\r\nConnection: close\r\n\r\n",
                           91))
     goto done;
-  dsm_sampler_init(&sampler, temp, top_p, top_k, min_p, seed,
-                   presence_penalty, frequency_penalty);
+  dsm_sampler_init(&sampler, temp, top_p, top_k, min_p, seed, presence_penalty,
+                   frequency_penalty);
   double decode_started = now();
   int finish_length = 1, streaming_tool = 0;
   for (int i = 0; i < max_tokens; ++i) {
@@ -861,7 +934,8 @@ static int generate(server *s, int fd, const dsm_json *root) {
       if (send) {
         char saved = pending.data[send];
         pending.data[send] = '\0';
-        int ok = sse_chunk(fd, request_id, pending.data, NULL);
+        int ok = sse_chunk(fd, request_id, NULL, pending.data, NULL);
+        streamed_reasoning = 1;
         pending.data[send] = saved;
         if (!ok)
           goto logged;
@@ -876,13 +950,26 @@ static int generate(server *s, int fd, const dsm_json *root) {
     error_response(fd, 500, "failed to parse generated tool call");
     goto logged;
   }
+  if (thinking) {
+    if (!strstr(content, "<think>") && !strstr(content, "</think>")) {
+      reasoning = content;
+      content = strdup("");
+    } else if (!split_reasoning(content, &reasoning, &content)) {
+      error_response(fd, 500, "failed to separate reasoning");
+      goto logged;
+    }
+  }
   if (stream) {
-    if ((tools_requested && !streaming_tool && pending.len &&
-         !sse_chunk(fd, request_id, pending.data, NULL)) ||
+    if ((thinking && !streamed_reasoning && reasoning && *reasoning &&
+         !sse_chunk(fd, request_id, NULL, reasoning, NULL)) ||
+        (thinking && content && *content &&
+         !sse_chunk(fd, request_id, content, NULL, NULL)) ||
+        (tools_requested && !thinking && !streaming_tool && pending.len &&
+         !sse_chunk(fd, request_id, pending.data, NULL, NULL)) ||
         (call_count && !sse_tool_chunks(fd, request_id, calls, call_count)) ||
-        (!tools_requested && pending.len &&
-         !sse_chunk(fd, request_id, pending.data, NULL)) ||
-        !sse_chunk(fd, request_id, NULL,
+        (!thinking && !tools_requested && pending.len &&
+         !sse_chunk(fd, request_id, pending.data, NULL, NULL)) ||
+        !sse_chunk(fd, request_id, NULL, NULL,
                    call_count      ? "tool_calls"
                    : finish_length ? "length"
                                    : "stop") ||
@@ -896,6 +983,10 @@ static int generate(server *s, int fd, const dsm_json *root) {
            LIT("\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,"
                "\"message\":{\"role\":\"assistant\",\"content\":"));
     json_string(&body, content);
+    if (reasoning && *reasoning) {
+      append(&body, LIT(",\"reasoning_content\":"));
+      json_string(&body, reasoning);
+    }
     if (call_count) {
       append(&body, LIT(",\"tool_calls\":["));
       for (size_t i = 0; i < call_count; ++i) {
@@ -937,6 +1028,7 @@ done:
   dsm_sampler_free(&sampler);
   dsm_tool_calls_free(calls, call_count);
   free(content);
+  free(reasoning);
   for (size_t i = 0; i < stop_count; ++i)
     free(stops[i]);
   free(stops);

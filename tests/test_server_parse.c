@@ -36,6 +36,32 @@ int main(void) {
         fprintf(stderr, "prompt render failed: %s\n", prompt ? prompt : error);
         free(prompt); dsm_json_free(root); return 1;
     }
+    dsm_json_free(root);
+    root = NULL;
+    free(prompt);
+    prompt = NULL;
+    const char *thinking_disabled =
+        "{\"chat_template_kwargs\":{\"enable_thinking\":false},\"messages\":[{\"role\":\"user\",\"content\":\"No thought\"}]}";
+    if (!dsm_json_parse(thinking_disabled, strlen(thinking_disabled), &root, error,
+                        sizeof(error)) ||
+        !dsm_server_make_prompt(root, &prompt) ||
+        !contains(prompt, "<think>\n\n</think>\n\n")) {
+        fprintf(stderr, "thinking-disabled prompt render failed\n");
+        free(prompt); dsm_json_free(root); return 1;
+    }
+    dsm_json_free(root);
+    root = NULL;
+    free(prompt);
+    prompt = NULL;
+    const char *reasoning_none =
+        "{\"reasoning_effort\":\"none\",\"messages\":[{\"role\":\"user\",\"content\":\"No thought\"}]}";
+    if (!dsm_json_parse(reasoning_none, strlen(reasoning_none), &root, error,
+                        sizeof(error)) ||
+        !dsm_server_make_prompt(root, &prompt) ||
+        !contains(prompt, "<think>\n\n</think>\n\n")) {
+        fprintf(stderr, "reasoning_effort prompt render failed\n");
+        free(prompt); dsm_json_free(root); return 1;
+    }
     if (!dsm_server_parse_tool_calls("I will read it.\n<tool_call>\n<function=read_file>\n<parameter=path>\nREADME.md\n</parameter>\n<parameter=offset>\n12\n</parameter>\n<parameter=options>\n{\"raw\":true}\n</parameter>\n</function>\n</tool_call>", &content, &calls, &count) ||
         strcmp(content, "I will read it.") || count != 1 ||
         strcmp(calls[0].name, "read_file") ||
