@@ -323,11 +323,14 @@ int dsm_metal_init(dsm_metal **out, const dsm_model *m, uint32_t context, char *
         {offsetof(struct dsm_metal, cache), @"cache_write"},
         {offsetof(struct dsm_metal, cache_f16), @"cache_write_f16"},
         {offsetof(struct dsm_metal, attention), @"attention_decode"},
+        {offsetof(struct dsm_metal, attention_f16), @"attention_decode_f16"},
         {offsetof(struct dsm_metal, attention_split), @"attention_decode_split"},
+        {offsetof(struct dsm_metal, attention_split_f16), @"attention_decode_split_f16"},
         {offsetof(struct dsm_metal, attention_merge), @"attention_decode_merge"},
         {offsetof(struct dsm_metal, add), @"add_inplace"},
         {offsetof(struct dsm_metal, add_rmsnorm), @"add_rmsnorm"},
         {offsetof(struct dsm_metal, qk_norm_rope), @"qk_norm_rope"},
+        {offsetof(struct dsm_metal, qk_norm_rope_f16), @"qk_norm_rope_f16"},
         {offsetof(struct dsm_metal, swiglu), @"swiglu"},
         {offsetof(struct dsm_metal, route_topk), @"route_topk"},
         {offsetof(struct dsm_metal, expert_q8), @"expert_q8_0_gemv"},
@@ -377,10 +380,6 @@ int dsm_metal_init(dsm_metal **out, const dsm_model *m, uint32_t context, char *
         {offsetof(struct dsm_metal, mmf_id[5]), @"mul_mm_id_q6_K_f32"},
     };
     if (!create_pipelines(s, lib, specs, sizeof(specs) / sizeof(*specs), error, error_size)) {
-        goto bad;
-    }
-    if (s->kv_f16) {
-        set_error(error, error_size, "F16 KV not supported for this path yet");
         goto bad;
     }
     const char *mmf_env = getenv("DSM_MM_F32");

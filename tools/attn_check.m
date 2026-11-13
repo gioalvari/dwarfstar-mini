@@ -9,7 +9,11 @@
 #include <string.h>
 #include <time.h>
 typedef struct { uint32_t heads, kv_heads, dim, pos0, context, layer, rows; } attn_params;
+typedef struct { uint32_t heads, kv_heads, dim, pos, context, layer; } decode_params;
+typedef struct { uint32_t heads, kv_heads, dim, pos, context, layer, splits; } decode_split_params;
 static float frand(uint64_t *s) { *s = *s * 6364136223846793005ULL + 1442695040888963407ULL; return (float)((*s >> 33) & 0xFFFFFF) / 16777216.0f * 2.f - 1.f; }
+static uint16_t f16_bits(float value) { _Float16 half = value; uint16_t bits; memcpy(&bits, &half, sizeof(bits)); return bits; }
+static float f16_float(uint16_t bits) { _Float16 half; memcpy(&half, &bits, sizeof(half)); return half; }
 static id<MTLComputePipelineState> mkpipe(id<MTLDevice> d, id<MTLLibrary> l, NSString *n) {
     NSError *e = nil; id<MTLFunction> f = [l newFunctionWithName:n]; if (!f) { fprintf(stderr, "missing %s\n", n.UTF8String); exit(1); }
     id<MTLComputePipelineState> p = [d newComputePipelineStateWithFunction:f error:&e]; if (!p) { fprintf(stderr, "%s\n", e.localizedDescription.UTF8String); exit(1); } return p; }
@@ -24,12 +28,38 @@ static double run(id<MTLDevice> d, id<MTLCommandQueue> qu, id<MTLComputePipeline
     [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
     if (cb.status != MTLCommandBufferStatusCompleted) { fprintf(stderr, "command buffer failed: %s\n", cb.error.localizedDescription.UTF8String); exit(1); }
     return (cb.GPUEndTime - cb.GPUStartTime) / reps; }
+static void run_decode(id<MTLCommandQueue> qu, id<MTLComputePipelineState> decode,
+                       id<MTLComputePipelineState> split, id<MTLComputePipelineState> merge,
+                       int use_split, id<MTLBuffer> q, id<MTLBuffer> k, id<MTLBuffer> v,
+                       id<MTLBuffer> out, id<MTLBuffer> scores, id<MTLBuffer> partial,
+                       decode_params a) {
+    id<MTLCommandBuffer> cb = [qu commandBuffer]; id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    if (use_split) { uint32_t splits = (a.pos + 64) / 64; decode_split_params p = {a.heads, a.kv_heads, a.dim, a.pos, a.context, a.layer, splits};
+        [e setComputePipelineState:split]; [e setBuffer:q offset:0 atIndex:0]; [e setBuffer:k offset:0 atIndex:1]; [e setBuffer:v offset:0 atIndex:2]; [e setBuffer:partial offset:0 atIndex:3]; [e setBytes:&p length:sizeof p atIndex:4]; [e setThreadgroupMemoryLength:(64 + 256) * sizeof(float) atIndex:0]; [e dispatchThreadgroups:MTLSizeMake(splits, a.heads, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [e setComputePipelineState:merge]; [e setBuffer:partial offset:0 atIndex:0]; [e setBuffer:out offset:0 atIndex:1]; [e setBytes:&p length:sizeof p atIndex:2]; [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0]; [e dispatchThreadgroups:MTLSizeMake(a.heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    } else { [e setComputePipelineState:decode]; [e setBuffer:q offset:0 atIndex:0]; [e setBuffer:k offset:0 atIndex:1]; [e setBuffer:v offset:0 atIndex:2]; [e setBuffer:out offset:0 atIndex:3]; [e setBuffer:scores offset:0 atIndex:4]; [e setBytes:&a length:sizeof a atIndex:5]; [e setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0]; [e dispatchThreadgroups:MTLSizeMake(a.heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)]; }
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted]; if (cb.status != MTLCommandBufferStatusCompleted) { fprintf(stderr, "decode failed: %s\n", cb.error.localizedDescription.UTF8String); exit(1); } }
+static int check_decode_f16(id<MTLDevice> d, id<MTLCommandQueue> qu, id<MTLLibrary> lib) {
+    id<MTLComputePipelineState> decode = mkpipe(d, lib, @"attention_decode"), decode16 = mkpipe(d, lib, @"attention_decode_f16"), split = mkpipe(d, lib, @"attention_decode_split"), split16 = mkpipe(d, lib, @"attention_decode_split_f16"), merge = mkpipe(d, lib, @"attention_decode_merge");
+    uint32_t positions[] = {0, 63, 511, 4095}; int fail = 0;
+    for (size_t pi = 0; pi < sizeof positions / sizeof *positions; ++pi) for (int use_split = 0; use_split < 2; ++use_split) {
+        decode_params a = {16, 8, 128, positions[pi], positions[pi] + 1, 1}; uint32_t width = a.kv_heads * a.dim, alloc = (a.context + 63) & ~63u, splits = (a.pos + 64) / 64; size_t total = (size_t)2 * alloc * width, outn = (size_t)a.heads * a.dim; uint64_t seed = 9137 + a.pos;
+        id<MTLBuffer> q = [d newBufferWithLength:outn * sizeof(float) options:MTLResourceStorageModeShared], k32 = [d newBufferWithLength:total * sizeof(float) options:MTLResourceStorageModeShared], v32 = [d newBufferWithLength:total * sizeof(float) options:MTLResourceStorageModeShared], k16 = [d newBufferWithLength:total * sizeof(uint16_t) options:MTLResourceStorageModeShared], v16 = [d newBufferWithLength:total * sizeof(uint16_t) options:MTLResourceStorageModeShared], out32 = [d newBufferWithLength:outn * sizeof(float) options:MTLResourceStorageModeShared], out16 = [d newBufferWithLength:outn * sizeof(float) options:MTLResourceStorageModeShared], scores = [d newBufferWithLength:(size_t)a.heads * a.context * sizeof(float) options:MTLResourceStorageModeShared], partial = [d newBufferWithLength:(size_t)a.heads * splits * (a.dim + 2) * sizeof(float) options:MTLResourceStorageModeShared];
+        float *qp = q.contents, *kp = k32.contents, *vp = v32.contents, *rawk = malloc(total * sizeof(float)), *rawv = malloc(total * sizeof(float)); uint16_t *kh = k16.contents, *vh = v16.contents;
+        for (size_t i = 0; i < outn; ++i) qp[i] = 2.f * frand(&seed);
+        for (size_t i = 0; i < total; ++i) { rawk[i] = 2.f * frand(&seed); rawv[i] = frand(&seed); kh[i] = f16_bits(rawk[i]); vh[i] = f16_bits(rawv[i]); kp[i] = f16_float(kh[i]); vp[i] = f16_float(vh[i]); }
+        run_decode(qu, decode, split, merge, use_split, q, k32, v32, out32, scores, partial, a); run_decode(qu, decode16, split16, merge, use_split, q, k16, v16, out16, scores, partial, a);
+        double num = 0, den = 0, storage_num = 0, storage_den = 0;
+        for (uint32_t h = 0; h < a.heads; ++h) for (uint32_t j = 0; j < a.dim; ++j) { uint32_t kvh = h / (a.heads / a.kv_heads); double max = -INFINITY, sum = 0, rounded = 0, raw = 0; for (uint32_t pos = 0; pos <= a.pos; ++pos) { double dot = 0; for (uint32_t z = 0; z < a.dim; ++z) dot += (double)qp[h * a.dim + z] * kp[((size_t)a.layer * a.context + pos) * width + kvh * a.dim + z]; double score = dot / sqrt(a.dim); if (score > max) max = score; } for (uint32_t pos = 0; pos <= a.pos; ++pos) { double dot = 0; for (uint32_t z = 0; z < a.dim; ++z) dot += (double)qp[h * a.dim + z] * kp[((size_t)a.layer * a.context + pos) * width + kvh * a.dim + z]; double weight = exp(dot / sqrt(a.dim) - max); sum += weight; rounded += weight * vp[((size_t)a.layer * a.context + pos) * width + kvh * a.dim + j]; raw += weight * rawv[((size_t)a.layer * a.context + pos) * width + kvh * a.dim + j]; } rounded /= sum; raw /= sum; double dd = ((float *)out16.contents)[h * a.dim + j] - ((float *)out32.contents)[h * a.dim + j]; num += dd * dd; den += rounded * rounded; dd = rounded - raw; storage_num += dd * dd; storage_den += raw * raw; }
+        double rel = sqrt(num / den), storage = sqrt(storage_num / storage_den); int bad = !(rel < 1e-5); fail |= bad; printf("decode%s pos=%u: f16 vs rounded f32 rel=%.2e | rounded vs unrounded rel=%.2e%s\n", use_split ? "-split" : "", a.pos, rel, storage, bad ? " FAIL" : ""); free(rawk); free(rawv); }
+    return fail; }
 int main(int argc, char **argv) {
     const char *path = argc > 1 ? argv[1] : "metal/dsm.metal"; float pad_fill = argc > 2 ? strtof(argv[2], NULL) : 0.f;
     id<MTLDevice> d = MTLCreateSystemDefaultDevice(); id<MTLCommandQueue> qu = [d newCommandQueue]; NSError *err = nil;
     NSString *src = [NSString stringWithContentsOfFile:@(path) encoding:NSUTF8StringEncoding error:&err];
     MTLCompileOptions *opt = [MTLCompileOptions new]; if (@available(macOS 15.0, *)) opt.mathMode = MTLMathModeSafe;
     id<MTLLibrary> lib = [d newLibraryWithSource:src options:opt error:&err]; if (!lib) { fprintf(stderr, "%s\n", err.localizedDescription.UTF8String); return 1; }
+    if (argc > 2 && !strcmp(argv[2], "--decode-f16")) return check_decode_f16(d, qu, lib);
     id<MTLComputePipelineState> fa = mkpipe(d, lib, @"attention_prefill_fa128"), ref = mkpipe(d, lib, @"attention_prefill_d128_tiled");
     uint32_t cfg[3][2] = {{16, 8}, {32, 4}, {40, 8}}, rowsv[] = {9, 33, 63, 64, 65, 570, 1024}, pos0v[] = {0, 100}; int fail = 0;
     for (int c = 0; c < 3; ++c) for (size_t ri = 0; ri < sizeof rowsv / 4; ++ri) for (int pi = 0; pi < 2; ++pi) {

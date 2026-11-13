@@ -152,7 +152,8 @@ struct dsm_metal {
     id<MTLResidencySet> residency;
     id<MTLComputePipelineState> q8, q2k, q3k, q4k, q5k, q6k, f32, norm, rope, rope_partial, cache,
         cache_f16,
-        attention, attention_split, attention_merge, add, add_rmsnorm, qk_norm_rope, swiglu,
+        attention, attention_f16, attention_split, attention_split_f16, attention_merge, add,
+        add_rmsnorm, qk_norm_rope, qk_norm_rope_f16, swiglu,
         route_topk, expert_q8, expert_q8_fast, expert_q3k, expert_q4k, expert_q5k, expert_q6k,
         expert_swiglu, moe_add;
     id<MTLComputePipelineState> split_q_gate, split_gdn_qk, l2norm, ssm_conv, gdn_gates, gdn,

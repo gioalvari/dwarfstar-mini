@@ -1209,6 +1209,53 @@ kernel void qk_norm_rope(device float *q [[buffer(0)]], device float *k [[buffer
     }
 }
 
+template<typename T>
+kernel void qk_norm_rope_impl(device float *q [[buffer(0)]], device float *k [[buffer(1)]],
+                               device const float *q_weight [[buffer(2)]],
+                               device const float *k_weight [[buffer(3)]],
+                               device T *keys [[buffer(4)]],
+                               constant QkNormRope &p [[buffer(5)]],
+                               ushort tid [[thread_index_in_threadgroup]],
+                               uint group [[threadgroup_position_in_grid]],
+                               threadgroup float *sum [[threadgroup(0)]]) {
+    bool is_k = group >= p.heads;
+    uint head = is_k ? group - p.heads : group;
+    if (head >= (is_k ? p.kv_heads : p.heads)) return;
+    device float *x = (is_k ? k : q) + head * p.dim;
+    device const float *weight = is_k ? k_weight : q_weight;
+    float v = 0.0f;
+    for (uint i = tid; i < p.dim; i += 256) v += x[i] * x[i];
+    sum[tid] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) {
+        if (tid < step) sum[tid] += sum[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float scale = rsqrt(sum[0] / float(p.dim) + p.eps);
+    uint pairs = p.dim / 2;
+    if (tid < pairs) {
+        uint i = tid;
+        float theta = float(p.pos) / pow(p.base, float(i) / float(pairs));
+        float c = cos(theta), s = sin(theta);
+        float a = x[i] * scale * weight[i];
+        float b = x[i + pairs] * scale * weight[i + pairs];
+        float lo = a * c - b * s;
+        float hi = a * s + b * c;
+        x[i] = lo;
+        x[i + pairs] = hi;
+        if (is_k) {
+            device T *out = keys +
+                    ((p.layer * p.context + p.pos) * p.kv_heads + head) * p.dim;
+            out[i] = T(lo);
+            out[i + pairs] = T(hi);
+        }
+    }
+}
+
+template [[host_name("qk_norm_rope_f16")]] kernel void qk_norm_rope_impl<half>(
+    device float *, device float *, device const float *, device const float *, device half *,
+    constant QkNormRope &, ushort, uint, threadgroup float *);
+
 kernel void rope_neox_batch(device float *x [[buffer(0)]], constant RopeBatch &p [[buffer(1)]], uint index [[thread_position_in_grid]]) {
     uint per_row = p.heads * (p.dim / 2);
     uint total = p.rows * per_row;
@@ -1515,6 +1562,66 @@ kernel void attention_decode(device const float *q [[buffer(0)]], device const f
     for (uint j = tid; j < p.dim; j += 256) { float value = 0; for (uint pos = 0; pos <= p.pos; ++pos) value += head_scores[pos] * inv_sum * values[((p.layer * p.context + pos) * width + kvh * p.dim + j)]; out[head * p.dim + j] = value; }
 }
 
+template<typename T>
+kernel void attention_decode_impl(device const float *q [[buffer(0)]],
+                                  device const T *keys [[buffer(1)]],
+                                  device const T *values [[buffer(2)]],
+                                  device float *out [[buffer(3)]],
+                                  device float *scores [[buffer(4)]],
+                                  constant Attention &p [[buffer(5)]],
+                                  ushort tid [[thread_index_in_threadgroup]],
+                                  uint head [[threadgroup_position_in_grid]],
+                                  threadgroup float *reduce [[threadgroup(0)]]) {
+    if (head >= p.heads) return;
+    uint kvh = head / (p.heads / p.kv_heads), width = p.kv_heads * p.dim;
+    device float *head_scores = scores + head * p.context;
+    float local_max = -INFINITY;
+    for (uint pos = tid; pos <= p.pos; pos += 256) {
+        device const T *k = keys + ((p.layer * p.context + pos) * width + kvh * p.dim);
+        float dot = 0;
+        for (uint z = 0; z < p.dim; z += 4) {
+            float4 q4 = *(device const float4 *)(q + head * p.dim + z);
+            float4 k4 = float4(*(device const vec<T, 4> *)(k + z));
+            dot += metal::dot(q4, k4);
+        }
+        float score = dot * rsqrt(float(p.dim));
+        head_scores[pos] = score;
+        local_max = max(local_max, score);
+    }
+    reduce[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) {
+        if (tid < step) reduce[tid] = max(reduce[tid], reduce[tid + step]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float maxv = reduce[0], local_sum = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint pos = tid; pos <= p.pos; pos += 256) {
+        float value = exp(head_scores[pos] - maxv);
+        head_scores[pos] = value;
+        local_sum += value;
+    }
+    reduce[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    for (uint step = 128; step; step >>= 1) {
+        if (tid < step) reduce[tid] += reduce[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_sum = 1.0f / reduce[0];
+    for (uint j = tid; j < p.dim; j += 256) {
+        float value = 0;
+        for (uint pos = 0; pos <= p.pos; ++pos) {
+            value += head_scores[pos] * inv_sum *
+                     float(values[((p.layer * p.context + pos) * width + kvh * p.dim + j)]);
+        }
+        out[head * p.dim + j] = value;
+    }
+}
+
+template [[host_name("attention_decode_f16")]] kernel void attention_decode_impl<half>(
+    device const float *, device const half *, device const half *, device float *, device float *,
+    constant Attention &, ushort, uint, threadgroup float *);
+
 // Decode attention is split across 64-token chunks.  The first pass leaves
 // each chunk in online-softmax form (maximum, denominator, numerator vector),
 // so the second pass can combine chunks without materializing all scores.
@@ -1589,6 +1696,82 @@ kernel void attention_decode_split(device const float *q [[buffer(0)]],
         dst[j + 2] = numerator;
     }
 }
+
+template<typename T>
+kernel void attention_decode_split_impl(device const float *q [[buffer(0)]],
+                                   device const T *keys [[buffer(1)]],
+                                   device const T *values [[buffer(2)]],
+                                   device float *partial [[buffer(3)]],
+                                   constant AttentionSplit &p [[buffer(4)]],
+                                   ushort tid [[thread_index_in_threadgroup]],
+                                   ushort lane [[thread_index_in_simdgroup]],
+                                   ushort simdgroup [[simdgroup_index_in_threadgroup]],
+                                   uint2 group [[threadgroup_position_in_grid]],
+                                   threadgroup float *scratch [[threadgroup(0)]]) {
+    constexpr uint CHUNK = 64;
+    uint split = group.x, head = group.y;
+    if (head >= p.heads || split >= p.splits) return;
+    uint start = split * CHUNK;
+    uint count = min(CHUNK, p.pos + 1 - start);
+    uint kvh = head / (p.heads / p.kv_heads);
+    uint width = p.kv_heads * p.dim;
+    threadgroup float *scores = scratch;
+    threadgroup float *reduce = scratch + CHUNK;
+
+    // Eight simdgroups compute eight 128-wide QK dots at a time.  A lane owns
+    // four elements, with the loop retaining support for non-128 dimensions.
+    for (uint base = 0; base < count; base += 8) {
+        uint index = base + simdgroup;
+        float dot = 0.0f;
+        if (index < count) {
+            device const T *key = keys +
+                ((p.layer * p.context + start + index) * width + kvh * p.dim);
+            device const float *query = q + head * p.dim;
+            for (uint z = lane * 4; z < p.dim; z += 128) {
+                float4 q4 = *(device const float4 *)(query + z);
+                float4 k4 = float4(*(device const vec<T, 4> *)(key + z));
+                dot += metal::dot(q4, k4);
+            }
+        }
+        dot = simd_sum(dot);
+        if (lane == 0 && index < count) scores[index] = dot * rsqrt(float(p.dim));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    reduce[tid] = tid < count ? scores[tid] : -INFINITY;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) {
+        if (tid < step) reduce[tid] = max(reduce[tid], reduce[tid + step]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float maximum = reduce[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float local_sum = tid < count ? exp(scores[tid] - maximum) : 0.0f;
+    reduce[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) {
+        if (tid < step) reduce[tid] += reduce[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float denominator = reduce[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device float *dst = partial + (head * p.splits + split) * (p.dim + 2);
+    if (tid == 0) { dst[0] = maximum; dst[1] = denominator; }
+    for (uint j = tid; j < p.dim; j += 256) {
+        float numerator = 0.0f;
+        for (uint i = 0; i < count; ++i) {
+            float weight = exp(scores[i] - maximum);
+            numerator += weight * values[((p.layer * p.context + start + i) * width +
+                                           kvh * p.dim + j)];
+        }
+        dst[j + 2] = numerator;
+    }
+}
+
+template [[host_name("attention_decode_split_f16")]] kernel void attention_decode_split_impl<half>(
+    device const float *, device const half *, device const half *, device float *,
+    constant AttentionSplit &, ushort, ushort, ushort, uint2, threadgroup float *);
 
 kernel void attention_decode_merge(device const float *partial [[buffer(0)]],
                                    device float *out [[buffer(1)]],

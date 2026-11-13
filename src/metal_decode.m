@@ -322,7 +322,7 @@ static void encode_qk_norm_rope(dsm_metal *s, id<MTLComputeCommandEncoder> e, co
         return;
     qk_norm_rope_params p = {s->m->heads, s->m->kv_heads, s->m->key_dim,   s->pos,
                              s->context,  layer,          s->m->rope_base, s->m->rms_eps};
-    [e setComputePipelineState:s->qk_norm_rope];
+    [e setComputePipelineState:s->kv_f16 ? s->qk_norm_rope_f16 : s->qk_norm_rope];
     [e setBuffer:s->q offset:0 atIndex:0];
     [e setBuffer:s->k offset:0 atIndex:1];
     [e setBuffer:qw offset:(NSUInteger)qoff atIndex:2];
@@ -354,25 +354,25 @@ static void encode_kv_store(dsm_metal *s, id<MTLComputeCommandEncoder> e, uint32
                             uint32_t pos) {
     uint32_t kvw = s->m->kv_heads * s->m->key_dim;
     cache_params cp = {layer, pos, s->context, kvw};
-    [e setComputePipelineState:s->cache];
+    [e setComputePipelineState:s->kv_f16 ? s->cache_f16 : s->cache];
     [e setBuffer:s->k offset:0 atIndex:0];
     [e setBuffer:s->keys offset:0 atIndex:1];
     [e setBytes:&cp length:sizeof(cp) atIndex:2];
-    dsm_mtl_dispatch_1d(e, s->cache, kvw);
+    dsm_mtl_dispatch_1d(e, s->kv_f16 ? s->cache_f16 : s->cache, kvw);
     [e setBuffer:s->v offset:0 atIndex:0];
     [e setBuffer:s->values offset:0 atIndex:1];
     [e setBytes:&cp length:sizeof(cp) atIndex:2];
-    dsm_mtl_dispatch_1d(e, s->cache, kvw);
+    dsm_mtl_dispatch_1d(e, s->kv_f16 ? s->cache_f16 : s->cache, kvw);
 }
 static void encode_v_store(dsm_metal *s, id<MTLComputeCommandEncoder> e, uint32_t layer,
                            uint32_t pos) {
     uint32_t kvw = s->m->kv_heads * s->m->key_dim;
     cache_params cp = {layer, pos, s->context, kvw};
-    [e setComputePipelineState:s->cache];
+    [e setComputePipelineState:s->kv_f16 ? s->cache_f16 : s->cache];
     [e setBuffer:s->v offset:0 atIndex:0];
     [e setBuffer:s->values offset:0 atIndex:1];
     [e setBytes:&cp length:sizeof(cp) atIndex:2];
-    dsm_mtl_dispatch_1d(e, s->cache, kvw);
+    dsm_mtl_dispatch_1d(e, s->kv_f16 ? s->cache_f16 : s->cache, kvw);
 }
 void dsm_mtl_encode_attention_decode_at(dsm_metal *s, id<MTLComputeCommandEncoder> e,
                                         uint32_t layer, uint32_t pos, id<MTLBuffer> q,
@@ -383,7 +383,7 @@ void dsm_mtl_encode_attention_decode_at(dsm_metal *s, id<MTLComputeCommandEncode
         uint32_t splits = (pos + 64) / 64;
         attn_split_params split = {m->heads,   m->kv_heads, m->key_dim, pos,
                                    s->context, layer,       splits};
-        [e setComputePipelineState:s->attention_split];
+        [e setComputePipelineState:s->kv_f16 ? s->attention_split_f16 : s->attention_split];
         [e setBuffer:q offset:q_off atIndex:0];
         [e setBuffer:s->keys offset:0 atIndex:1];
         [e setBuffer:s->values offset:0 atIndex:2];
@@ -401,7 +401,7 @@ void dsm_mtl_encode_attention_decode_at(dsm_metal *s, id<MTLComputeCommandEncode
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         return;
     }
-    [e setComputePipelineState:s->attention];
+    [e setComputePipelineState:s->kv_f16 ? s->attention_f16 : s->attention];
     [e setBuffer:q offset:q_off atIndex:0];
     [e setBuffer:s->keys offset:0 atIndex:1];
     [e setBuffer:s->values offset:0 atIndex:2];

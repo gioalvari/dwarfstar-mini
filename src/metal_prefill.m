@@ -705,7 +705,7 @@ static int prefill_chunk(dsm_metal *s, const int32_t *tokens, uint32_t rows, flo
 int dsm_metal_prefill(dsm_metal *s, const int32_t *tokens, uint32_t n, float *logits) {
     if (!s || !tokens || !n || !logits || n > s->context - s->pos)
         return 0;
-    if ((dsm_mtl_qwen35_arch(s->m) &&
+    if (s->kv_f16 || (dsm_mtl_qwen35_arch(s->m) &&
          (!dsm_mtl_hybrid_prefill_enabled() || getenv("DSM_DUMP_DIR"))) ||
         s->profile.enabled || !dsm_mtl_prefill_enabled()) {
         for (uint32_t i = 0; i < n; ++i)
